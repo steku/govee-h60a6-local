@@ -94,6 +94,25 @@ python3 tools/govee_cli.py --host <DEVICE_IP> --ble AA:BB:CC:DD:EE:FF color "#FF
 
 ---
 
+## Official Govee H60A6 Scenes (Offline Bundle)
+
+To load all 66+ official Govee H60A6 scenes (including multi-packet `scenceParam` effects) into Home Assistant's **Effect** dropdown while keeping runtime 100% local, run the one-time scene fetcher before copying `custom_components/govee_h60a6_local` to Home Assistant:
+
+```bash
+python3 tools/fetch_h60a6_scenes.py
+```
+
+This downloads the official `H60A6` catalog from `app2.govee.com` into `custom_components/govee_h60a6_local/scenes_h60a6.json` (no API key or Govee account required). Once bundled, Home Assistant needs zero internet access—hardware scenes are dispatched locally over BLE (`0xA3` parameter frames + `33 05 04 <lo> <hi>`).
+
+List or trigger bundled scenes from the CLI:
+
+```bash
+python3 tools/govee_cli.py scenes
+python3 tools/govee_cli.py --ble <BLE_MAC> --mode ble_only scene "Aurora"
+```
+
+---
+
 ## Example Home Assistant Service Calls
 
 ```yaml

@@ -207,110 +207,82 @@ class VisualTestRunner:
                 break
 
     async def test_ring_protocols(self) -> None:
-        print("\n=== SECTION 2: ptReal & AMBIENT RING PROTOCOL DISCOVERY ===")
+        print("\n=== SECTION 2: DUAL-ZONE & AMBIENT RING VERIFICATION ===")
         print(
-            "This tests whether ptReal works over your transport AND which exact\n"
-            "byte layout controls the H60A6 ambient ring vs main panel."
+            "Tests verified H60A6 `33 05 15 01` dual-zone bitmask control\n"
+            "(0x0FFF = 12 ring segments, 0x1000 = main panel, 0x1FFF = full fixture)."
         )
-        # Put light in a neutral dim warm white baseline first
+        # Put light in a neutral warm white baseline first
         await self.client.async_turn(True)
         await self.client.async_set_brightness(80)
         await self.client.async_set_color_temp(3000)
 
-        # Build candidate 20-byte packets
-        pkt_ptreal_rgb = protocol.build_ble_rgb_packet(255, 0, 128)
-        pkt_ptreal_scene = protocol.build_ble_scene_packet(4)
-        pkt_1501_0fff = protocol.build_ble_segment_color_packet(255, 0, 0, 0x0FFF)
-        pkt_0b_0fff = protocol.build_ble_segment_color_v2_packet(0, 255, 0, 0x0FFF)
-        pkt_1501_1ffe = protocol.build_ble_segment_color_packet(0, 0, 255, 0x1FFE)
-        pkt_0b_1ffe = protocol.build_ble_segment_color_v2_packet(255, 0, 255, 0x1FFE)
-        pkt_1501_7fff = protocol.build_ble_segment_color_packet(0, 255, 255, 0x7FFF)
-        pkt_1501_ffff = protocol.build_ble_segment_color_packet(255, 165, 0, 0xFFFF)
-        # Alternate legacy layout: 33 05 15 01 R G B 00 00 mask_lo mask_hi
-        pkt_1501_b9_le = protocol.build_ble_packet(
-            [0x33, 0x05, 0x15, 0x01, 255, 255, 0, 0, 0, 0xFF, 0x0F]
-        )
-        # Segment brightness test
-        pkt_br_20 = protocol.build_ble_segment_brightness_packet(20, 0x0FFF)
-        pkt_br_100 = protocol.build_ble_segment_brightness_packet(100, 0x0FFF)
-
-        # Sub-device / dual-zone power/mode probes sometimes used on Govee dual-zone lamps
-        pkt_a5_seg_red = protocol.build_ble_packet(
-            [0x33, 0x05, 0x0B, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x7F]
-        )
-
         steps: list[tuple[str, str, str, Callable[[], Awaitable[str]]]] = [
             (
-                "P1",
-                "Baseline ptReal RGB (`33 05 02` -> PINK)",
-                "Light changes to PINK (proves `ptReal` is accepted over current transport!)",
-                lambda: self._send_pkt(pkt_ptreal_rgb),
-            ),
-            (
-                "P2",
-                "Baseline ptReal Scene (`33 05 04 04`)",
-                "Light switches to a built-in dynamic scene",
-                lambda: self._send_pkt(pkt_ptreal_scene),
-            ),
-            (
                 "R1",
-                "Segment `33 05 15 01` bytes 12-13 LE, mask=0x0FFF -> RED",
-                "Ambient ring (or segments 1-12) turns RED",
-                lambda: self._send_pkt(pkt_1501_0fff),
+                "Ambient Ring (`0x0FFF`) -> RED 100%",
+                "Ambient ring turns RED while main panel stays warm white",
+                lambda: self._wrap(
+                    self.client.async_set_segment_color(
+                        255, 0, 0, const.ALL_RING_SEGMENTS_MASK, brightness_pct=100
+                    ),
+                    "ring=RED@100%",
+                ),
             ),
             (
                 "R2",
-                "Segment `33 05 0b` bytes 8-9 LE, mask=0x0FFF -> GREEN",
-                "Ambient ring (or segments 1-12) turns GREEN",
-                lambda: self._send_pkt(pkt_0b_0fff),
+                "Ambient Ring (`0x0FFF`) -> BLUE 25%",
+                "Ambient ring dims to low BLUE while main panel stays unchanged",
+                lambda: self._wrap(
+                    self.client.async_set_segment_color(
+                        0, 0, 255, const.ALL_RING_SEGMENTS_MASK, brightness_pct=25
+                    ),
+                    "ring=BLUE@25%",
+                ),
             ),
             (
                 "R3",
-                "Segment `33 05 15 01` shifted mask=0x1FFE (bits 1..12) -> BLUE",
-                "Ambient ring turns BLUE (note if main stays separate!)",
-                lambda: self._send_pkt(pkt_1501_1ffe),
+                "Ambient Ring (`0x0FFF`) -> GREEN 100%",
+                "Ambient ring brightens to GREEN",
+                lambda: self._wrap(
+                    self.client.async_set_segment_color(
+                        0, 255, 0, const.ALL_RING_SEGMENTS_MASK, brightness_pct=100
+                    ),
+                    "ring=GREEN@100%",
+                ),
             ),
             (
                 "R4",
-                "Segment `33 05 0b` shifted mask=0x1FFE (bits 1..12) -> MAGENTA",
-                "Ambient ring turns MAGENTA",
-                lambda: self._send_pkt(pkt_0b_1ffe),
+                "Main Panel ONLY (`0x1000`) -> MAGENTA 100%",
+                "Main panel turns MAGENTA while ambient ring stays GREEN",
+                lambda: self._wrap(
+                    self.client.async_set_segment_color(
+                        255, 0, 255, const.MAIN_LIGHT_SEGMENT_MASK, brightness_pct=100
+                    ),
+                    "main=MAGENTA@100%",
+                ),
             ),
             (
                 "R5",
-                "Segment `33 05 15 01` mask=0x7FFF (15-seg trailer FF 7F) -> CYAN",
-                "Segments turn CYAN",
-                lambda: self._send_pkt(pkt_1501_7fff),
+                "Ambient Ring OFF (`0x0FFF` -> 0%)",
+                "Ambient ring turns OFF while main panel stays MAGENTA",
+                lambda: self._wrap(
+                    self.client.async_set_segment_brightness(
+                        0, const.ALL_RING_SEGMENTS_MASK
+                    ),
+                    "ring=OFF",
+                ),
             ),
             (
                 "R6",
-                "Segment `33 05 15 01` mask=0xFFFF (all 16 bits) -> ORANGE",
-                "Segments turn ORANGE",
-                lambda: self._send_pkt(pkt_1501_ffff),
-            ),
-            (
-                "R7",
-                "Segment `33 05 15 01` alt bytes 9-10 LE, mask=0x0FFF -> YELLOW",
-                "Segments turn YELLOW",
-                lambda: self._send_pkt(pkt_1501_b9_le),
-            ),
-            (
-                "R8",
-                "Segment `33 05 0b` mask=0x7FFF -> RED",
-                "Segments turn RED",
-                lambda: self._send_pkt(pkt_a5_seg_red),
-            ),
-            (
-                "R9",
-                "Segment Brightness `33 05 15 02` -> 20% then 100%",
-                "Ring/segments dim to 20%",
-                lambda: self._send_pkt(pkt_br_20),
-            ),
-            (
-                "R10",
-                "Segment Brightness `33 05 15 02` -> 100%",
-                "Ring/segments brighten back to 100%",
-                lambda: self._send_pkt(pkt_br_100),
+                "Full Fixture (`0x1FFF`) -> ORANGE 100%",
+                "Both main panel and ambient ring turn ORANGE",
+                lambda: self._wrap(
+                    self.client.async_set_segment_color(
+                        255, 165, 0, const.ALL_FIXTURE_SEGMENTS_MASK, brightness_pct=100
+                    ),
+                    "fixture=ORANGE@100%",
+                ),
             ),
         ]
 
@@ -472,7 +444,11 @@ class VisualTestRunner:
 
         for seg in range(1, 14):
             mask = 1 << (seg - 1)
-            label = f"Segment {seg} (bit {seg - 1}, mask=0x{mask:04X})"
+            label = (
+                "Main Panel (bit 12, mask=0x1000)"
+                if seg == 13
+                else f"Ring Segment {seg} (bit {seg - 1}, mask=0x{mask:04X})"
+            )
 
             async def _light_one(m: int = mask, s: int = seg) -> str:
                 # Reset previous to dim red, highlight current in bright cyan
@@ -482,7 +458,7 @@ class VisualTestRunner:
             cont = await self.run_step(
                 f"S{seg}",
                 f"Highlight {label}",
-                f"ONLY {label} turns bright CYAN (note if it's a ring slice or the main center!)",
+                f"ONLY {label} turns bright CYAN",
                 _light_one,
             )
             if not cont:
@@ -492,10 +468,10 @@ class VisualTestRunner:
         self, proto: str, r: int, g: int, b: int, mask: int, brightness: int
     ) -> str:
         if proto == "1501":
-            pkt = protocol.build_ble_segment_color_packet(r, g, b, mask)
-            br = protocol.build_ble_segment_brightness_packet(brightness, mask)
-            used = await self.client.async_send_raw_packets([pkt, br])
-            return f"[{used}] color={pkt.hex()} br={br.hex()}"
+            used = await self.client.async_set_segment_color(
+                r, g, b, segment_mask=mask, brightness_pct=brightness
+            )
+            return f"[{used}] mask=0x{mask:04x} rgb=({r},{g},{b}) brightness={brightness}%"
         if proto == "0b":
             pkt = protocol.build_ble_segment_color_v2_packet(r, g, b, mask)
             used = await self.client.async_send_raw_packets([pkt])
@@ -537,11 +513,12 @@ class VisualTestRunner:
 
     async def run(self) -> int:
         try:
-            sections = (
-                ["core", "ring", "segments", "razer"]
-                if self.args.only == "all"
-                else [self.args.only]
-            )
+            if self.args.only == "all":
+                sections = ["core", "ring", "segments"]
+                if self.client.wifi_enabled:
+                    sections.append("razer")
+            else:
+                sections = [self.args.only]
             for sec in sections:
                 if sec == "core":
                     await self.test_core()
@@ -581,8 +558,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ring-proto",
         choices=["both", "1501", "0b", "razer"],
-        default="both",
-        help="Protocol for Section 3 segment walk (default: both)",
+        default="1501",
+        help="Protocol for Section 3 segment walk (default: 1501)",
     )
     p.add_argument(
         "--listen-port",

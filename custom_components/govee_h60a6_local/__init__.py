@@ -24,12 +24,12 @@ from .const import (
     DEFAULT_POLL_INTERVAL,
     DOMAIN,
     GOVEE_LISTEN_PORT,
-    RING_SEGMENT_COUNT,
     SERVICE_SEND_MUSIC_MODE,
     SERVICE_SEND_RAW_PTREAL,
     SERVICE_SEND_SCENE,
     SERVICE_SET_RAZER_SEGMENTS,
     SERVICE_SET_SEGMENT_COLOR,
+    TOTAL_SEGMENT_COUNT,
     TRANSPORT_WIFI_PREFERRED,
 )
 from .coordinator import GoveeH60A6Coordinator
@@ -52,7 +52,7 @@ SERVICE_SET_SEGMENT_COLOR_SCHEMA = vol.Schema(
         vol.Optional("entry_id"): cv.string,
         vol.Required("segments"): vol.All(
             cv.ensure_list,
-            [vol.All(vol.Coerce(int), vol.Range(min=1, max=RING_SEGMENT_COUNT))],
+            [vol.All(vol.Coerce(int), vol.Range(min=1, max=TOTAL_SEGMENT_COUNT))],
         ),
         vol.Required("rgb_color"): RGB_SCHEMA,
         vol.Optional("brightness_pct"): vol.All(

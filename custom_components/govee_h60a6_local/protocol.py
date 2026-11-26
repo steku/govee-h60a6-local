@@ -12,12 +12,19 @@ import base64
 from dataclasses import dataclass, field
 import json
 import math
+import os
 from typing import Any
 
-from .const import ALL_RING_SEGMENTS_MASK, MAX_KELVIN, MIN_KELVIN, RING_SEGMENT_COUNT
+from .const import (
+    ALL_FIXTURE_SEGMENTS_MASK,
+    ALL_RING_SEGMENTS_MASK,
+    MAX_KELVIN,
+    MIN_KELVIN,
+    TOTAL_SEGMENT_COUNT,
+)
 
 
-@dataclass(slots=True)
+@dataclass
 class DiscoveredDevice:
     """Device information parsed from a Govee LAN `scan` response."""
 
@@ -30,7 +37,7 @@ class DiscoveredDevice:
     wifi_version_soft: str = ""
 
 
-@dataclass(slots=True)
+@dataclass
 class GoveeDeviceStatus:
     """State snapshot parsed from a Govee LAN `devStatus` response."""
 
@@ -40,16 +47,17 @@ class GoveeDeviceStatus:
     color_temp_kelvin: int  # 0 when in RGB mode, otherwise 2200..6500
 
 
-@dataclass(slots=True)
+@dataclass
 class SegmentState:
     """Tracked state for an individual ring segment or sub-zone."""
 
     is_on: bool = True
     brightness: int = 100  # 0..100
     rgb: tuple[int, int, int] = (255, 255, 255)
+    color_temp_kelvin: int = 0  # 0 = RGB mode, 2200..6500 = dedicated white channel
 
 
-@dataclass(slots=True)
+@dataclass
 class GoveeState:
     """Aggregated state tracked for a Govee H60A6 fixture."""
 
@@ -60,7 +68,7 @@ class GoveeState:
     effect: str | None = None
     ring: SegmentState = field(default_factory=SegmentState)
     segments: list[SegmentState] = field(
-        default_factory=lambda: [SegmentState() for _ in range(RING_SEGMENT_COUNT)]
+        default_factory=lambda: [SegmentState() for _ in range(TOTAL_SEGMENT_COUNT)]
     )
     active_transport: str = "offline"
     available: bool = False
@@ -261,21 +269,60 @@ def build_ble_brightness_packet(brightness_pct: int) -> bytes:
 
 
 def build_ble_rgb_packet(r: int, g: int, b: int) -> bytes:
-    """Build 20-byte static RGB packet (`33 05 02 R G B`)."""
+    """Build 20-byte full-fixture RGB packet (`33 05 15 01` with mask `0x1FFF`)."""
+    return build_ble_segment_color_packet(r, g, b, ALL_FIXTURE_SEGMENTS_MASK)
+
+
+def build_ble_segment_color_temp_packet(
+    kelvin: int,
+    segment_mask: int = ALL_FIXTURE_SEGMENTS_MASK,
+) -> bytes:
+    """Build 20-byte dedicated WW/CW Kelvin segment packet (`33 05 15 01`).
+
+    Layout:
+      [0..3]   33 05 15 01
+      [4..6]   00 00 00 (disable RGB mixing, engage dedicated WW/CW LEDs)
+      [7..8]   Kelvin big-endian (k_hi, k_lo)
+      [9..11]  Warm/cool white RGB approximation (wr, wg, wb)
+      [12..13] 16-bit little-endian segment bitmask (mask_lo, mask_hi)
+      [14..18] 00 00 00 00 00
+      [19]     XOR checksum
+    """
+    clamped_k = clamp(kelvin, MIN_KELVIN, MAX_KELVIN)
+    wr, wg, wb = kelvin_to_rgb(clamped_k)
+    k_hi = (clamped_k >> 8) & 0xFF
+    k_lo = clamped_k & 0xFF
+    mask = segment_mask & 0xFFFF
+    mask_lo = mask & 0xFF
+    mask_hi = (mask >> 8) & 0xFF
     return build_ble_packet(
-        [0x33, 0x05, 0x02, clamp(r, 0, 255), clamp(g, 0, 255), clamp(b, 0, 255)]
+        [
+            0x33,
+            0x05,
+            0x15,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            k_hi,
+            k_lo,
+            wr,
+            wg,
+            wb,
+            mask_lo,
+            mask_hi,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ]
     )
 
 
 def build_ble_color_temp_packet(kelvin: int) -> bytes:
-    """Build 20-byte white color temperature packet (`33 05 02 FF FF FF 01 R G B`).
-
-    Sets the RGB lock bytes to `FF FF FF` with white-mode flag `0x01` followed by
-    the warm/cool RGB white balance target for the requested Kelvin value.
-    """
-    clamped_k = clamp(kelvin, MIN_KELVIN, MAX_KELVIN)
-    r, g, b = kelvin_to_rgb(clamped_k)
-    return build_ble_packet([0x33, 0x05, 0x02, 0xFF, 0xFF, 0xFF, 0x01, r, g, b])
+    """Build 20-byte full-fixture dedicated WW/CW white color temperature packet."""
+    return build_ble_segment_color_temp_packet(kelvin, ALL_FIXTURE_SEGMENTS_MASK)
 
 
 def build_ble_segment_color_packet(
@@ -387,12 +434,98 @@ def build_ble_segment_brightness_packet(
 
 
 def build_ble_scene_packet(scene_id: int) -> bytes:
-    """Build 20-byte hardware scene activation packet (`33 05 04 <id>`)."""
+    """Build 20-byte hardware scene activation packet (`33 05 04 <lo> <hi>`).
+
+    Govee encodes 16-bit scene codes in little-endian order.
+    """
     if scene_id < 0 or scene_id > 0xFFFF:
         raise ValueError(f"scene_id must be 0..65535 (got {scene_id})")
-    if scene_id <= 0xFF:
-        return build_ble_packet([0x33, 0x05, 0x04, scene_id])
-    return build_ble_packet([0x33, 0x05, 0x04, (scene_id >> 8) & 0xFF, scene_id & 0xFF])
+    return build_ble_packet([0x33, 0x05, 0x04, scene_id & 0xFF, (scene_id >> 8) & 0xFF])
+
+
+def build_ble_multipacket_scene_packets(
+    scene_code: int, scene_param_b64: str | None = None
+) -> list[bytes]:
+    """Build `0xA3` multi-packet parameter upload frames + `33 05 04` activation frame.
+
+    When `scene_param_b64` is empty or None, returns `[build_ble_scene_packet(scene_code)]`.
+    Otherwise decodes the base64 `scenceParam` payload, translates Govee cloud's
+    `0x50` stream header byte to `0x58` (verified against the Govee app's H60A6
+    BLE capture), splits it across 20-byte `0xA3` frames (15 bytes in line 0 after
+    `[0xA3, 0x00, 0x01, total_lines]`, 17 bytes per subsequent frame with final
+    frame index `0xFF`), and appends the little-endian `33 05 04` activation packet.
+    """
+    if not scene_param_b64:
+        return [build_ble_scene_packet(scene_code)]
+
+    raw = base64.b64decode(scene_param_b64)
+    if not raw:
+        return [build_ble_scene_packet(scene_code)]
+
+    # H60A6 BLE firmware expects header byte 0x58 for uploaded scene_param streams
+    # (Govee's light-effect-libraries API stores 0x50; sending 0x50 returns error a3 50 0a).
+    if raw[0] == 0x50:
+        raw = bytes([0x58]) + raw[1:]
+
+    # Multi-layer 0x20 scenes use variable-length 0xA4 frames followed by a 4-byte
+    # `a4 ff ff a4` terminator (verified against H60A6 BLE capture [0676]/[0677] for Sunrise 19075).
+    # In legacy 0xA3 scenes like 35-byte Halloween B (19096), bytes 1..2 are the little-endian
+    # payload length (`len(raw) - 3`), which happens to equal `0x0020` (= 32).
+    is_a4_scene = (
+        len(raw) >= 3
+        and raw[1] == 0x20
+        and int.from_bytes(raw[1:3], "little") != len(raw) - 3
+    )
+    if is_a4_scene:
+        first_a4 = raw[:237]
+        rem_a4 = raw[237:]
+        tail_a4 = (
+            [rem_a4[i : i + 240] for i in range(0, len(rem_a4), 240)]
+            if rem_a4
+            else [b""]
+        )
+        total_packets = 1 + len(tail_a4)
+        head_body = (
+            bytes(
+                [
+                    0xA4,
+                    0x00,
+                    0x00,
+                    0x01,
+                    total_packets & 0xFF,
+                    (total_packets >> 8) & 0xFF,
+                ]
+            )
+            + first_a4
+        )
+        frames = [head_body + bytes([compute_xor_checksum(head_body)])]
+        for idx, chunk in enumerate(tail_a4, start=1):
+            seq_lo, seq_hi = (
+                (0xFF, 0xFF)
+                if idx == len(tail_a4)
+                else (idx & 0xFF, (idx >> 8) & 0xFF)
+            )
+            chunk_body = bytes([0xA4, seq_lo, seq_hi]) + chunk
+            frames.append(chunk_body + bytes([compute_xor_checksum(chunk_body)]))
+        frames.append(build_ble_scene_packet(scene_code))
+        return frames
+
+    first_chunk = raw[:15]
+    remainder = raw[15:]
+    tail_chunks = [remainder[i : i + 17] for i in range(0, len(remainder), 17)]
+    total_lines = 1 + len(tail_chunks)
+    if total_lines > 0xFF:
+        raise ValueError(f"Scene parameter payload too large ({total_lines} lines)")
+
+    frames: list[bytes] = [
+        build_ble_packet([0xA3, 0x00, 0x01, total_lines, *first_chunk])
+    ]
+    for idx, chunk in enumerate(tail_chunks, start=1):
+        line_idx = 0xFF if idx == total_lines - 1 else idx
+        frames.append(build_ble_packet([0xA3, line_idx, *chunk]))
+
+    frames.append(build_ble_scene_packet(scene_code))
+    return frames
 
 
 def build_ble_music_mode_packet(mode_id: int, sensitivity: int = 50) -> bytes:
@@ -400,6 +533,190 @@ def build_ble_music_mode_packet(mode_id: int, sensitivity: int = 50) -> bytes:
     return build_ble_packet(
         [0x33, 0x05, 0x13, clamp(mode_id, 0, 255), clamp(sensitivity, 1, 100)]
     )
+
+
+# ---------------------------------------------------------------------------
+# Govee BLE Session Encryption (AES-128-ECB + RC4) & Handshake Packets
+# ---------------------------------------------------------------------------
+
+_AES_SBOX = (
+    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
+    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
+    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
+    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
+    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
+    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
+    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
+    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
+    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
+    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
+    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
+    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
+    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
+    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
+    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
+    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
+)
+
+_AES_INV_SBOX = (
+    0x52, 0x09, 0x6A, 0xD5, 0x30, 0x36, 0xA5, 0x38, 0xBF, 0x40, 0xA3, 0x9E, 0x81, 0xF3, 0xD7, 0xFB,
+    0x7C, 0xE3, 0x39, 0x82, 0x9B, 0x2F, 0xFF, 0x87, 0x34, 0x8E, 0x43, 0x44, 0xC4, 0xDE, 0xE9, 0xCB,
+    0x54, 0x7B, 0x94, 0x32, 0xA6, 0xC2, 0x23, 0x3D, 0xEE, 0x4C, 0x95, 0x0B, 0x42, 0xFA, 0xC3, 0x4E,
+    0x08, 0x2E, 0xA1, 0x66, 0x28, 0xD9, 0x24, 0xB2, 0x76, 0x5B, 0xA2, 0x49, 0x6D, 0x8B, 0xD1, 0x25,
+    0x72, 0xF8, 0xF6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xD4, 0xA4, 0x5C, 0xCC, 0x5D, 0x65, 0xB6, 0x92,
+    0x6C, 0x70, 0x48, 0x50, 0xFD, 0xED, 0xB9, 0xDA, 0x5E, 0x15, 0x46, 0x57, 0xA7, 0x8D, 0x9D, 0x84,
+    0x90, 0xD8, 0xAB, 0x00, 0x8C, 0xBC, 0xD3, 0x0A, 0xF7, 0xE4, 0x58, 0x05, 0xB8, 0xB3, 0x45, 0x06,
+    0xD0, 0x2C, 0x1E, 0x8F, 0xCA, 0x3F, 0x0F, 0x02, 0xC1, 0xAF, 0xBD, 0x03, 0x01, 0x13, 0x8A, 0x6B,
+    0x3A, 0x91, 0x11, 0x41, 0x4F, 0x67, 0xDC, 0xEA, 0x97, 0xF2, 0xCF, 0xCE, 0xF0, 0xB4, 0xE6, 0x73,
+    0x96, 0xAC, 0x74, 0x22, 0xE7, 0xAD, 0x35, 0x85, 0xE2, 0xF9, 0x37, 0xE8, 0x1C, 0x75, 0xDF, 0x6E,
+    0x47, 0xF1, 0x1A, 0x71, 0x1D, 0x29, 0xC5, 0x89, 0x6F, 0xB7, 0x62, 0x0E, 0xAA, 0x18, 0xBE, 0x1B,
+    0xFC, 0x56, 0x3E, 0x4B, 0xC6, 0xD2, 0x79, 0x20, 0x9A, 0xDB, 0xC0, 0xFE, 0x78, 0xCD, 0x5A, 0xF4,
+    0x1F, 0xDD, 0xA8, 0x33, 0x88, 0x07, 0xC7, 0x31, 0xB1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xEC, 0x5F,
+    0x60, 0x51, 0x7F, 0xA9, 0x19, 0xB5, 0x4A, 0x0D, 0x2D, 0xE5, 0x7A, 0x9F, 0x93, 0xC9, 0x9C, 0xEF,
+    0xA0, 0xE0, 0x3B, 0x4D, 0xAE, 0x2A, 0xF5, 0xB0, 0xC8, 0xEB, 0xBB, 0x3C, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2B, 0x04, 0x7E, 0xBA, 0x77, 0xD6, 0x26, 0xE1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0C, 0x7D,
+)
+
+_AES_RCON = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
+
+
+def _xtime(a: int) -> int:
+    return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else (a << 1)
+
+
+def _gf_mul(a: int, b: int) -> int:
+    res = 0
+    for _ in range(8):
+        if b & 1:
+            res ^= a
+        a = _xtime(a)
+        b >>= 1
+    return res
+
+
+def _aes128_expand_key(key: bytes) -> list[list[int]]:
+    rk = list(key)
+    for i in range(10):
+        t0, t1, t2, t3 = rk[-4], rk[-3], rk[-2], rk[-1]
+        t0, t1, t2, t3 = (
+            _AES_SBOX[t1] ^ _AES_RCON[i],
+            _AES_SBOX[t2],
+            _AES_SBOX[t3],
+            _AES_SBOX[t0],
+        )
+        base = len(rk) - 16
+        rk.extend([rk[base] ^ t0, rk[base + 1] ^ t1, rk[base + 2] ^ t2, rk[base + 3] ^ t3])
+        for _ in range(3):
+            base = len(rk) - 16
+            rk.extend(
+                [
+                    rk[base] ^ rk[-4],
+                    rk[base + 1] ^ rk[-3],
+                    rk[base + 2] ^ rk[-2],
+                    rk[base + 3] ^ rk[-1],
+                ]
+            )
+    return [rk[i : i + 16] for i in range(0, 176, 16)]
+
+
+def _aes128_encrypt_block(block: bytes, key: bytes) -> bytes:
+    rounds = _aes128_expand_key(key)
+    s = [b ^ k for b, k in zip(block, rounds[0])]
+    for r in range(1, 11):
+        s = [_AES_SBOX[b] for b in s]
+        s = [
+            s[0], s[5], s[10], s[15],
+            s[4], s[9], s[14], s[3],
+            s[8], s[13], s[2], s[7],
+            s[12], s[1], s[6], s[11],
+        ]
+        if r < 10:
+            for c in range(0, 16, 4):
+                a0, a1, a2, a3 = s[c], s[c + 1], s[c + 2], s[c + 3]
+                t = a0 ^ a1 ^ a2 ^ a3
+                s[c] = a0 ^ t ^ _xtime(a0 ^ a1)
+                s[c + 1] = a1 ^ t ^ _xtime(a1 ^ a2)
+                s[c + 2] = a2 ^ t ^ _xtime(a2 ^ a3)
+                s[c + 3] = a3 ^ t ^ _xtime(a3 ^ a0)
+        rk = rounds[r]
+        s = [b ^ k for b, k in zip(s, rk)]
+    return bytes(s)
+
+
+def _aes128_decrypt_block(block: bytes, key: bytes) -> bytes:
+    rounds = _aes128_expand_key(key)
+    s = [b ^ k for b, k in zip(block, rounds[10])]
+    for r in range(9, -1, -1):
+        s = [
+            s[0], s[13], s[10], s[7],
+            s[4], s[1], s[14], s[11],
+            s[8], s[5], s[2], s[15],
+            s[12], s[9], s[6], s[3],
+        ]
+        s = [_AES_INV_SBOX[b] for b in s]
+        rk = rounds[r]
+        s = [b ^ k for b, k in zip(s, rk)]
+        if r > 0:
+            for c in range(0, 16, 4):
+                a0, a1, a2, a3 = s[c], s[c + 1], s[c + 2], s[c + 3]
+                s[c] = _gf_mul(a0, 14) ^ _gf_mul(a1, 11) ^ _gf_mul(a2, 13) ^ _gf_mul(a3, 9)
+                s[c + 1] = _gf_mul(a0, 9) ^ _gf_mul(a1, 14) ^ _gf_mul(a2, 11) ^ _gf_mul(a3, 13)
+                s[c + 2] = _gf_mul(a0, 13) ^ _gf_mul(a1, 9) ^ _gf_mul(a2, 14) ^ _gf_mul(a3, 11)
+                s[c + 3] = _gf_mul(a0, 11) ^ _gf_mul(a1, 13) ^ _gf_mul(a2, 9) ^ _gf_mul(a3, 14)
+    return bytes(s)
+
+
+def _rc4_crypt(data: bytes, key: bytes) -> bytes:
+    s = list(range(256))
+    j = 0
+    klen = len(key)
+    for i in range(256):
+        j = (j + s[i] + key[i % klen]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    i = 0
+    j = 0
+    out = bytearray(len(data))
+    for idx, b in enumerate(data):
+        i = (i + 1) & 0xFF
+        j = (j + s[i]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+        out[idx] = b ^ s[(s[i] + s[j]) & 0xFF]
+    return bytes(out)
+
+
+def _crypt_ble_blocks(packet: bytes, key: bytes, encrypt: bool) -> bytes:
+    """Encrypt/decrypt each full 16-byte block with AES-128-ECB and any remainder with RC4."""
+    if len(key) != 16:
+        raise ValueError(f"Govee BLE key must be 16 bytes (got {len(key)})")
+    if not packet:
+        raise ValueError("Govee BLE packet cannot be empty")
+    block_fn = _aes128_encrypt_block if encrypt else _aes128_decrypt_block
+    n_blocks = len(packet) // 16
+    out = bytearray()
+    for blk_idx in range(n_blocks):
+        out.extend(block_fn(packet[blk_idx * 16 : (blk_idx + 1) * 16], key))
+    tail_offset = n_blocks * 16
+    if tail_offset < len(packet):
+        out.extend(_rc4_crypt(packet[tail_offset:], key))
+    return bytes(out)
+
+
+def govee_ble_encrypt(packet: bytes, key: bytes) -> bytes:
+    """Encrypt a Govee BLE packet with AES-128-ECB per 16-byte block + RC4 tail."""
+    return _crypt_ble_blocks(packet, key, encrypt=True)
+
+
+def govee_ble_decrypt(packet: bytes, key: bytes) -> bytes:
+    """Decrypt a Govee BLE packet with AES-128-ECB per 16-byte block + RC4 tail."""
+    return _crypt_ble_blocks(packet, key, encrypt=False)
+
+
+def build_ble_handshake_packet(step: int, nonce: bytes | None = None) -> bytes:
+    """Build a 20-byte Govee BLE session handshake packet (`E7 <step>` + 17-byte nonce + XOR)."""
+    pad = nonce[:17] if nonce is not None else os.urandom(17)
+    if len(pad) < 17:
+        pad = pad + bytes(17 - len(pad))
+    return build_ble_packet([0xE7, step & 0xFF, *pad])
 
 
 # ---------------------------------------------------------------------------

@@ -24,12 +24,13 @@ from .const import (
     DOMAIN,
     EFFECT_SOLID,
     LOCAL_EFFECTS,
+    MAIN_CENTER_SEGMENT,
     MAX_KELVIN,
     MIN_KELVIN,
     MODEL_SKU,
     NATIVE_MUSIC_MODES,
-    NATIVE_SCENES,
     RING_SEGMENT_COUNT,
+    TOTAL_SEGMENT_COUNT,
 )
 from .protocol import (
     GoveeState,
@@ -38,6 +39,7 @@ from .protocol import (
     parse_hex_to_ble_packet,
     segments_to_bitmask,
 )
+from .scenes import GoveeScene, load_h60a6_scenes
 from .transport import GoveeH60A6Client, GoveeTransportError
 
 _LOGGER = logging.getLogger(__name__)
@@ -111,6 +113,8 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
 
         self._effect_task: asyncio.Task[None] | None = None
         self._transition_task: asyncio.Task[None] | None = None
+        self._segments_initialized: bool = False
+        self.scenes: dict[str, GoveeScene] = load_h60a6_scenes()
 
         super().__init__(
             hass,
@@ -118,6 +122,18 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
             name=f"{DOMAIN}_{entry.entry_id}",
             update_interval=timedelta(seconds=poll_interval),
         )
+
+    @property
+    def available_effects(self) -> list[str]:
+        """Return verified hardware scenes + local effects for HA's Effect dropdown."""
+        native_scenes = [
+            name for name, scene in self.scenes.items() if scene.scene_param
+        ]
+        return [
+            EFFECT_SOLID,
+            *native_scenes,
+            *LOCAL_EFFECTS,
+        ]
 
     async def _async_update_data(self) -> GoveeState:
         """Poll `devStatus` over Wi-Fi LAN (or maintain optimistic BLE state)."""
@@ -130,11 +146,46 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
             raise UpdateFailed(str(err)) from err
 
         if status is not None:
+            prev_is_on = self.state.is_on
+            prev_rgb = self.state.rgb
+            prev_kelvin = self.state.color_temp_kelvin
             self.state.is_on = status.is_on
             self.state.brightness = status.brightness
             self.state.color_temp_kelvin = status.color_temp_kelvin
             if status.color_temp_kelvin == 0:
                 self.state.rgb = status.rgb
+            seed_rgb = (
+                status.rgb
+                if status.color_temp_kelvin == 0
+                else kelvin_to_rgb(status.color_temp_kelvin)
+            )
+            if not self._segments_initialized:
+                self._sync_segments_color(
+                    seed_rgb,
+                    color_temp_kelvin=status.color_temp_kelvin,
+                    mark_on=status.is_on,
+                )
+                self._segments_initialized = True
+            else:
+                color_changed = (
+                    status.color_temp_kelvin != prev_kelvin
+                    or (status.color_temp_kelvin == 0 and status.rgb != prev_rgb)
+                )
+                if color_changed:
+                    self._sync_segments_color(
+                        seed_rgb,
+                        color_temp_kelvin=status.color_temp_kelvin,
+                        mark_on=status.is_on,
+                        reset_brightness=True,
+                    )
+                elif (
+                    not prev_is_on
+                    and status.is_on
+                    and not any(seg.is_on for seg in self.state.segments)
+                ):
+                    self.state.ring.is_on = True
+                    for seg in self.state.segments:
+                        seg.is_on = True
             if not status.is_on:
                 await self._cancel_effect_task()
                 self.state.effect = None
@@ -176,6 +227,38 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
         await self._cancel_transition_task()
         await self._cancel_effect_task()
         await self.client.async_close()
+
+    def _sync_segments_color(
+        self,
+        rgb: tuple[int, int, int],
+        *,
+        color_temp_kelvin: int = 0,
+        mark_on: bool = False,
+        reset_brightness: bool = False,
+    ) -> None:
+        """Keep tracked ring and per-segment RGB/Kelvin aligned with whole-fixture changes.
+
+        Individual ring segments (1..12) remain in RGB mode (`color_temp_kelvin = 0`)
+        so toggling a single Ring Segment entity always targets only its bitmask via
+        pure RGB `33 05 15 01` rather than a multi-zone white/brightness frame.
+        """
+        self.state.ring.rgb = rgb
+        self.state.ring.color_temp_kelvin = color_temp_kelvin
+        if mark_on:
+            self.state.ring.is_on = True
+        if reset_brightness:
+            self.state.ring.brightness = 100
+        for seg in self.state.segments[:RING_SEGMENT_COUNT]:
+            seg.rgb = rgb
+            seg.color_temp_kelvin = 0
+        center_seg = self.state.segments[MAIN_CENTER_SEGMENT - 1]
+        center_seg.rgb = rgb
+        center_seg.color_temp_kelvin = color_temp_kelvin
+        for seg in self.state.segments:
+            if mark_on:
+                seg.is_on = True
+            if reset_brightness:
+                seg.brightness = 100
 
     def _notify_state(self) -> None:
         self.state.active_transport = self.client.active_transport
@@ -239,17 +322,30 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
         ):
             await self.client.async_turn(True)
             self.state.is_on = True
+            if not any(seg.is_on for seg in self.state.segments):
+                self.state.ring.is_on = True
+                for seg in self.state.segments:
+                    seg.is_on = True
 
         if rgb is not None:
             r, g, b = clamp(rgb[0], 0, 255), clamp(rgb[1], 0, 255), clamp(rgb[2], 0, 255)
             await self.client.async_set_rgb(r, g, b)
             self.state.rgb = (r, g, b)
             self.state.color_temp_kelvin = 0
+            self._sync_segments_color((r, g, b), mark_on=True, reset_brightness=True)
+            self._segments_initialized = True
 
         if color_temp_kelvin is not None:
             kelvin = clamp(color_temp_kelvin, MIN_KELVIN, MAX_KELVIN)
             await self.client.async_set_color_temp(kelvin)
             self.state.color_temp_kelvin = kelvin
+            self._sync_segments_color(
+                kelvin_to_rgb(kelvin),
+                color_temp_kelvin=kelvin,
+                mark_on=True,
+                reset_brightness=True,
+            )
+            self._segments_initialized = True
 
         if brightness_pct is not None:
             pct = clamp(brightness_pct, 1, 100)
@@ -304,10 +400,19 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
                     await self.client.async_set_rgb(r, g, b)
                     self.state.rgb = (r, g, b)
                     self.state.color_temp_kelvin = 0
+                    self._sync_segments_color((r, g, b), mark_on=True, reset_brightness=True)
+                    self._segments_initialized = True
                 elif target_kelvin is not None:
                     k = round(start_k + (target_kelvin - start_k) * frac)
                     await self.client.async_set_color_temp(k)
                     self.state.color_temp_kelvin = k
+                    self._sync_segments_color(
+                        kelvin_to_rgb(k),
+                        color_temp_kelvin=k,
+                        mark_on=True,
+                        reset_brightness=True,
+                    )
+                    self._segments_initialized = True
 
                 if target_brightness is not None:
                     pct = clamp(
@@ -356,20 +461,30 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
             await self.client.async_turn(True)
             self.state.is_on = True
 
-        if effect in NATIVE_SCENES:
-            await self.client.async_set_scene(NATIVE_SCENES[effect])
+        if effect in self.scenes:
+            scene = self.scenes[effect]
+            await self.client.async_set_scene(scene.scene_code, scene.scene_param)
             self.state.effect = effect
+            self.state.ring.is_on = True
+            for seg in self.state.segments:
+                seg.is_on = True
             self._notify_state()
             return
 
         if effect in NATIVE_MUSIC_MODES:
             await self.client.async_set_music_mode(NATIVE_MUSIC_MODES[effect], sensitivity=60)
             self.state.effect = effect
+            self.state.ring.is_on = True
+            for seg in self.state.segments:
+                seg.is_on = True
             self._notify_state()
             return
 
         if effect in LOCAL_EFFECTS:
             self.state.effect = effect
+            self.state.ring.is_on = True
+            for seg in self.state.segments:
+                seg.is_on = True
             self._effect_task = self.hass.async_create_task(
                 self._run_local_effect(effect)
             )
@@ -417,15 +532,18 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
         *,
         is_on: bool,
         rgb: tuple[int, int, int] | None = None,
+        color_temp_kelvin: int | None = None,
         brightness_pct: int | None = None,
     ) -> None:
         """Control the H60A6 ambient halo ring (segments 1..12) via ptReal/BLE."""
         await self._cancel_effect_task()
-        if not is_on:
+        ring_segments = self.state.segments[:RING_SEGMENT_COUNT]
+        if not is_on or brightness_pct == 0:
             await self.client.async_set_segment_brightness(0, ALL_RING_SEGMENTS_MASK)
             self.state.ring.is_on = False
-            for seg in self.state.segments:
+            for seg in ring_segments:
                 seg.is_on = False
+            self._segments_initialized = True
             self._notify_state()
             return
 
@@ -433,27 +551,112 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
             await self.client.async_turn(True)
             self.state.is_on = True
 
-        target_rgb = rgb if rgb is not None else self.state.ring.rgb
+        if rgb is None and color_temp_kelvin is None and brightness_pct is None:
+            # Restore each ring segment's own remembered RGB/Kelvin & brightness
+            grouped: dict[tuple[tuple[int, int, int], int, int], list[int]] = {}
+            for seg_idx, seg in enumerate(ring_segments, start=1):
+                key = (seg.rgb, seg.color_temp_kelvin, max(1, seg.brightness))
+                grouped.setdefault(key, []).append(seg_idx)
+            for (seg_rgb, seg_k, seg_b), indices in grouped.items():
+                mask = segments_to_bitmask(indices)
+                if seg_k > 0:
+                    await self.client.async_set_segment_color_temp(
+                        seg_k, segment_mask=mask, brightness_pct=seg_b
+                    )
+                else:
+                    await self.client.async_set_segment_color(
+                        seg_rgb[0],
+                        seg_rgb[1],
+                        seg_rgb[2],
+                        segment_mask=mask,
+                        brightness_pct=seg_b,
+                    )
+            self.state.ring.is_on = True
+            for seg in ring_segments:
+                seg.is_on = True
+            self._segments_initialized = True
+            self._notify_state()
+            return
+
         target_b = (
             clamp(brightness_pct, 1, 100)
             if brightness_pct is not None
             else max(1, self.state.ring.brightness)
         )
-        await self.client.async_set_segment_color(
-            target_rgb[0],
-            target_rgb[1],
-            target_rgb[2],
-            segment_mask=ALL_RING_SEGMENTS_MASK,
-            brightness_pct=target_b,
-        )
-        self.state.ring.is_on = True
-        self.state.ring.rgb = target_rgb
-        self.state.ring.brightness = target_b
-        for seg in self.state.segments:
-            seg.is_on = True
-            seg.rgb = target_rgb
-            seg.brightness = target_b
+        if color_temp_kelvin is not None:
+            kelvin = clamp(color_temp_kelvin, MIN_KELVIN, MAX_KELVIN)
+            await self.client.async_set_segment_color_temp(
+                kelvin, segment_mask=ALL_RING_SEGMENTS_MASK, brightness_pct=target_b
+            )
+            ring_rgb = kelvin_to_rgb(kelvin)
+            self.state.ring.is_on = True
+            self.state.ring.rgb = ring_rgb
+            self.state.ring.color_temp_kelvin = kelvin
+            self.state.ring.brightness = target_b
+            for seg in ring_segments:
+                seg.is_on = True
+                seg.rgb = ring_rgb
+                seg.color_temp_kelvin = 0
+                seg.brightness = target_b
+        elif rgb is not None:
+            await self.client.async_set_segment_color(
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                segment_mask=ALL_RING_SEGMENTS_MASK,
+                brightness_pct=target_b,
+            )
+            self.state.ring.is_on = True
+            self.state.ring.rgb = rgb
+            self.state.ring.color_temp_kelvin = 0
+            self.state.ring.brightness = target_b
+            for seg in ring_segments:
+                seg.is_on = True
+                seg.rgb = rgb
+                seg.color_temp_kelvin = 0
+                seg.brightness = target_b
+        else:
+            # Brightness-only update preserves ring Kelvin vs RGB mode
+            if self.state.ring.color_temp_kelvin > 0:
+                await self.client.async_set_segment_color_temp(
+                    self.state.ring.color_temp_kelvin,
+                    segment_mask=ALL_RING_SEGMENTS_MASK,
+                    brightness_pct=target_b,
+                )
+            else:
+                await self.client.async_set_segment_color(
+                    self.state.ring.rgb[0],
+                    self.state.ring.rgb[1],
+                    self.state.ring.rgb[2],
+                    segment_mask=ALL_RING_SEGMENTS_MASK,
+                    brightness_pct=target_b,
+                )
+            self.state.ring.is_on = True
+            self.state.ring.brightness = target_b
+            for seg in ring_segments:
+                seg.is_on = True
+                seg.brightness = target_b
+
+        self._segments_initialized = True
         self._notify_state()
+
+    async def async_set_center(
+        self,
+        *,
+        is_on: bool,
+        rgb: tuple[int, int, int] | None = None,
+        color_temp_kelvin: int | None = None,
+        brightness_pct: int | None = None,
+    ) -> None:
+        """Control the H60A6 main center panel (segment 13, bitmask 0x1000)."""
+        await self._cancel_effect_task()
+        await self.async_set_segments(
+            [MAIN_CENTER_SEGMENT],
+            is_on=is_on,
+            rgb=rgb,
+            color_temp_kelvin=color_temp_kelvin,
+            brightness_pct=brightness_pct,
+        )
 
     async def async_set_segments(
         self,
@@ -461,18 +664,23 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
         *,
         is_on: bool = True,
         rgb: tuple[int, int, int] | None = None,
+        color_temp_kelvin: int | None = None,
         brightness_pct: int | None = None,
     ) -> None:
-        """Control specific 1-based ring segments (1..12) via ptReal/BLE."""
-        valid = [idx for idx in segment_indices if 1 <= idx <= RING_SEGMENT_COUNT]
+        """Control specific 1-based segments (1..12 = ring, 13 = main center) via ptReal/BLE."""
+        valid = [idx for idx in segment_indices if 1 <= idx <= TOTAL_SEGMENT_COUNT]
         if not valid:
-            raise ValueError(f"Segments must be between 1 and {RING_SEGMENT_COUNT}")
+            raise ValueError(f"Segments must be between 1 and {TOTAL_SEGMENT_COUNT}")
 
         mask = segments_to_bitmask(valid)
-        if not is_on:
+        if not is_on or brightness_pct == 0:
             await self.client.async_set_segment_brightness(0, mask)
             for idx in valid:
                 self.state.segments[idx - 1].is_on = False
+            self.state.ring.is_on = any(
+                seg.is_on for seg in self.state.segments[:RING_SEGMENT_COUNT]
+            )
+            self._segments_initialized = True
             self._notify_state()
             return
 
@@ -480,25 +688,90 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
             await self.client.async_turn(True)
             self.state.is_on = True
 
-        first_seg = self.state.segments[valid[0] - 1]
-        target_rgb = rgb if rgb is not None else first_seg.rgb
-        target_b = (
-            clamp(brightness_pct, 1, 100)
-            if brightness_pct is not None
-            else max(1, first_seg.brightness)
-        )
-        await self.client.async_set_segment_color(
-            target_rgb[0],
-            target_rgb[1],
-            target_rgb[2],
-            segment_mask=mask,
-            brightness_pct=target_b,
-        )
-        for idx in valid:
-            seg = self.state.segments[idx - 1]
-            seg.is_on = True
-            seg.rgb = target_rgb
-            seg.brightness = target_b
+        if rgb is None and color_temp_kelvin is None and brightness_pct is None:
+            # Restore each requested segment's own remembered RGB/Kelvin and brightness
+            grouped: dict[tuple[tuple[int, int, int], int, int], list[int]] = {}
+            for idx in valid:
+                seg = self.state.segments[idx - 1]
+                key = (seg.rgb, seg.color_temp_kelvin, max(1, seg.brightness))
+                grouped.setdefault(key, []).append(idx)
+            for (seg_rgb, seg_k, seg_b), indices in grouped.items():
+                sub_mask = segments_to_bitmask(indices)
+                if seg_k > 0:
+                    await self.client.async_set_segment_color_temp(
+                        seg_k, segment_mask=sub_mask, brightness_pct=seg_b
+                    )
+                else:
+                    await self.client.async_set_segment_color(
+                        seg_rgb[0],
+                        seg_rgb[1],
+                        seg_rgb[2],
+                        segment_mask=sub_mask,
+                        brightness_pct=seg_b,
+                    )
+            for idx in valid:
+                self.state.segments[idx - 1].is_on = True
+        else:
+            first_seg = self.state.segments[valid[0] - 1]
+            target_b = (
+                clamp(brightness_pct, 1, 100)
+                if brightness_pct is not None
+                else max(1, first_seg.brightness)
+            )
+            if color_temp_kelvin is not None:
+                kelvin = clamp(color_temp_kelvin, MIN_KELVIN, MAX_KELVIN)
+                await self.client.async_set_segment_color_temp(
+                    kelvin, segment_mask=mask, brightness_pct=target_b
+                )
+                kelvin_rgb = kelvin_to_rgb(kelvin)
+                for idx in valid:
+                    seg = self.state.segments[idx - 1]
+                    seg.is_on = True
+                    seg.rgb = kelvin_rgb
+                    seg.color_temp_kelvin = kelvin
+                    seg.brightness = target_b
+            elif rgb is not None:
+                await self.client.async_set_segment_color(
+                    rgb[0],
+                    rgb[1],
+                    rgb[2],
+                    segment_mask=mask,
+                    brightness_pct=target_b,
+                )
+                for idx in valid:
+                    seg = self.state.segments[idx - 1]
+                    seg.is_on = True
+                    seg.rgb = rgb
+                    seg.color_temp_kelvin = 0
+                    seg.brightness = target_b
+            elif first_seg.color_temp_kelvin > 0:
+                await self.client.async_set_segment_color_temp(
+                    first_seg.color_temp_kelvin,
+                    segment_mask=mask,
+                    brightness_pct=target_b,
+                )
+                for idx in valid:
+                    seg = self.state.segments[idx - 1]
+                    seg.is_on = True
+                    seg.brightness = target_b
+            else:
+                await self.client.async_set_segment_color(
+                    first_seg.rgb[0],
+                    first_seg.rgb[1],
+                    first_seg.rgb[2],
+                    segment_mask=mask,
+                    brightness_pct=target_b,
+                )
+                for idx in valid:
+                    seg = self.state.segments[idx - 1]
+                    seg.is_on = True
+                    seg.brightness = target_b
+
+        if any(idx <= RING_SEGMENT_COUNT for idx in valid):
+            self.state.ring.is_on = any(
+                seg.is_on for seg in self.state.segments[:RING_SEGMENT_COUNT]
+            )
+        self._segments_initialized = True
         self._notify_state()
 
     # -----------------------------------------------------------------------

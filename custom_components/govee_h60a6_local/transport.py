@@ -22,7 +22,9 @@ from typing import Any
 
 from .const import (
     ALL_RING_SEGMENTS_MASK,
+    BLE_HANDSHAKE_PSK,
     BLE_NOTIFY_CHAR_UUID,
+    BLE_SERVICE_UUID,
     BLE_WRITE_CHAR_UUID,
     DEFAULT_BLE_IDLE_TIMEOUT,
     DEFAULT_COMMAND_DELAY_MS,
@@ -40,14 +42,16 @@ from .protocol import (
     GoveeDeviceStatus,
     build_ble_brightness_packet,
     build_ble_color_temp_packet,
+    build_ble_handshake_packet,
     build_ble_keepalive_packet,
+    build_ble_multipacket_scene_packets,
     build_ble_music_mode_packet,
     build_ble_power_packet,
     build_ble_rgb_packet,
     build_ble_scene_packet,
     build_ble_segment_brightness_packet,
     build_ble_segment_color_packet,
-    build_ble_segment_color_v2_packet,
+    build_ble_segment_color_temp_packet,
     build_brightness_payload,
     build_color_payload,
     build_color_temp_payload,
@@ -58,6 +62,8 @@ from .protocol import (
     build_scan_payload,
     build_status_payload,
     build_turn_payload,
+    govee_ble_decrypt,
+    govee_ble_encrypt,
     parse_lan_response,
     parse_scan_response,
     parse_status_response,
@@ -224,7 +230,7 @@ class GoveeLanHub:
         try:
             self.send_command(host, build_status_payload())
             return await asyncio.wait_for(fut, timeout=timeout)
-        except TimeoutError as err:
+        except (TimeoutError, asyncio.TimeoutError) as err:
             raise TimeoutError(
                 f"Timed out after {timeout:.1f}s waiting for devStatus from {host}"
             ) from err
@@ -327,6 +333,9 @@ class GoveeBleTransport:
         self._client: Any | None = None
         self._lock = asyncio.Lock()
         self._disconnect_timer: asyncio.TimerHandle | None = None
+        self._session_key: bytes | None = None
+        self._handshake_future: asyncio.Future[bytes] | None = None
+        self._handshake_expected_step: int | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -367,24 +376,92 @@ class GoveeBleTransport:
             from bleak import BleakClient
 
             client = BleakClient(
-                self.address, disconnected_callback=self._on_disconnected
+                self.address,
+                disconnected_callback=self._on_disconnected,
+                services=[BLE_SERVICE_UUID],
             )
             await client.connect()
             self._client = client
 
         try:
             await self._client.start_notify(BLE_NOTIFY_CHAR_UUID, self._on_notify)
+            await self._async_handshake(self._client)
         except Exception as err:
-            _LOGGER.debug("BLE notify subscription skipped for %s: %s", self.address, err)
+            _LOGGER.debug("BLE notify/handshake skipped for %s: %s", self.address, err)
 
         return self._client
 
     def _on_disconnected(self, _client: Any) -> None:
         _LOGGER.debug("Govee BLE disconnected from %s", self.address)
         self._client = None
+        self._session_key = None
+        if self._handshake_future is not None and not self._handshake_future.done():
+            self._handshake_future.cancel()
+        self._handshake_future = None
+        self._handshake_expected_step = None
 
     def _on_notify(self, _sender: Any, data: bytearray) -> None:
-        _LOGGER.debug("Govee BLE notify (%s): %s", self.address, data.hex())
+        raw = bytes(data)
+        if (
+            self._handshake_future is not None
+            and not self._handshake_future.done()
+            and len(raw) >= 16
+        ):
+            try:
+                dec = govee_ble_decrypt(raw, BLE_HANDSHAKE_PSK)
+            except Exception:
+                dec = b""
+            if len(dec) >= 2 and dec[0] == 0xE7 and dec[1] == self._handshake_expected_step:
+                self._handshake_future.set_result(dec)
+                return
+
+        if self._session_key is not None and len(raw) >= 16:
+            try:
+                dec = govee_ble_decrypt(raw, self._session_key)
+                _LOGGER.debug("Govee BLE notify (%s): %s", self.address, dec.hex())
+                return
+            except Exception:
+                pass
+        _LOGGER.debug("Govee BLE notify (%s): %s", self.address, raw.hex())
+
+    async def _async_handshake(self, client: Any) -> None:
+        """Perform the MakingLifeSmarte E701/E702 session key handshake if supported."""
+        loop = asyncio.get_running_loop()
+        self._session_key = None
+        try:
+            fut1: asyncio.Future[bytes] = loop.create_future()
+            self._handshake_expected_step = 0x01
+            self._handshake_future = fut1
+            tx1 = govee_ble_encrypt(build_ble_handshake_packet(0x01), BLE_HANDSHAKE_PSK)
+            await client.write_gatt_char(BLE_WRITE_CHAR_UUID, tx1, response=False)
+            try:
+                dec1 = await asyncio.wait_for(fut1, timeout=2.0)
+            except (TimeoutError, asyncio.TimeoutError):
+                _LOGGER.debug(
+                    "Govee BLE %s did not respond to E701 handshake; using plaintext",
+                    self.address,
+                )
+                return
+
+            session_key = dec1[2:18]
+            if len(session_key) != 16:
+                return
+
+            fut2: asyncio.Future[bytes] = loop.create_future()
+            self._handshake_expected_step = 0x02
+            self._handshake_future = fut2
+            tx2 = govee_ble_encrypt(build_ble_handshake_packet(0x02), BLE_HANDSHAKE_PSK)
+            await client.write_gatt_char(BLE_WRITE_CHAR_UUID, tx2, response=False)
+            try:
+                await asyncio.wait_for(fut2, timeout=1.0)
+            except (TimeoutError, asyncio.TimeoutError):
+                pass
+
+            self._session_key = session_key
+            _LOGGER.debug("Govee BLE %s negotiated encrypted session", self.address)
+        finally:
+            self._handshake_future = None
+            self._handshake_expected_step = None
 
     def _schedule_idle_disconnect(self) -> None:
         if self._disconnect_timer is not None:
@@ -402,12 +479,21 @@ class GoveeBleTransport:
         async with self._lock:
             try:
                 client = await self._ensure_connected()
-                for packet in packets:
-                    await client.write_gatt_char(
-                        BLE_WRITE_CHAR_UUID, packet, response=False
+                for idx, packet in enumerate(packets):
+                    wire_packet = (
+                        govee_ble_encrypt(packet, self._session_key)
+                        if self._session_key is not None
+                        else packet
                     )
-                    if len(packets) > 1:
-                        await asyncio.sleep(0.03)
+                    await client.write_gatt_char(
+                        BLE_WRITE_CHAR_UUID, wire_packet, response=False
+                    )
+                    if idx + 1 < len(packets):
+                        next_pkt = packets[idx + 1]
+                        if packet[0] in (0xA3, 0xA4) and next_pkt[0] == 0x33:
+                            await asyncio.sleep(0.22)
+                        else:
+                            await asyncio.sleep(0.03)
                 self._schedule_idle_disconnect()
             except Exception as err:
                 await self._disconnect_unlocked()
@@ -430,6 +516,11 @@ class GoveeBleTransport:
             self._disconnect_timer = None
         client = self._client
         self._client = None
+        self._session_key = None
+        if self._handshake_future is not None and not self._handshake_future.done():
+            self._handshake_future.cancel()
+        self._handshake_future = None
+        self._handshake_expected_step = None
         if client is not None and getattr(client, "is_connected", False):
             try:
                 await client.disconnect()
@@ -632,26 +723,17 @@ class GoveeH60A6Client:
         )
 
     async def _dispatch_ptreal_packets(self, packets: list[bytes]) -> str:
-        """Send one or more 20-byte frames, preferring BLE when available.
+        """Send one or more 20-byte frames via BLE when configured, else Wi-Fi `ptReal`.
 
         H60A6 firmware ignores `cmd: "ptReal"` over Wi-Fi LAN UDP 4003 for
         ambient ring, per-segment, and scene commands, while accepting the exact
         same 20-byte frames directly over Bluetooth LE GATT. Therefore, when BLE
-        is configured, route 20-byte frames over BLE first and only fall back to
-        Wi-Fi `ptReal` if BLE is unavailable.
+        is configured, send strictly over BLE and let errors propagate so HA does
+        not optimistically update segment state when BLE delivery fails.
         """
         if self.ble_enabled and self.ble is not None:
-            try:
-                await self.ble.async_send_packets(packets)
-                return "ble"
-            except Exception as err:
-                _LOGGER.warning(
-                    "Govee H60A6 BLE send for segment/scene failed (%s); "
-                    "trying Wi-Fi ptReal fallback",
-                    err,
-                )
-                if not self.wifi_enabled:
-                    raise
+            await self.ble.async_send_packets(packets)
+            return "ble"
 
         last_transport = "offline"
         for pkt in packets:
@@ -666,17 +748,23 @@ class GoveeH60A6Client:
         segment_mask: int = ALL_RING_SEGMENTS_MASK,
         brightness_pct: int | None = None,
     ) -> str:
-        """Set RGB color (and optional brightness) on one or more H60A6 segments.
-
-        Emits both `33 05 15 01` (bitmask at bytes 12-13 LE) and `33 05 0b`
-        (bitmask at bytes 8-9 LE) so both H60A6 firmware generations respond.
-        """
-        packets = [
-            build_ble_segment_color_packet(r, g, b, segment_mask),
-            build_ble_segment_color_v2_packet(r, g, b, segment_mask),
-        ]
+        """Set RGB color (and optional brightness) on one or more H60A6 segments."""
         if brightness_pct is not None:
-            packets.append(build_ble_segment_brightness_packet(brightness_pct, segment_mask))
+            scale = max(0, min(100, int(brightness_pct))) / 100.0
+            r = round(r * scale)
+            g = round(g * scale)
+            b = round(b * scale)
+        packets = [build_ble_segment_color_packet(r, g, b, segment_mask)]
+        return await self._dispatch_ptreal_packets(packets)
+
+    async def async_set_segment_color_temp(
+        self,
+        kelvin: int,
+        segment_mask: int = ALL_RING_SEGMENTS_MASK,
+        brightness_pct: int | None = None,
+    ) -> str:
+        """Set dedicated WW/CW Kelvin color temperature on one or more segments."""
+        packets = [build_ble_segment_color_temp_packet(kelvin, segment_mask)]
         return await self._dispatch_ptreal_packets(packets)
 
     async def async_set_segment_brightness(
@@ -685,19 +773,18 @@ class GoveeH60A6Client:
         segment_mask: int = ALL_RING_SEGMENTS_MASK,
     ) -> str:
         """Set brightness (0..100%) on specific H60A6 segments."""
-        packets = [build_ble_segment_brightness_packet(brightness_pct, segment_mask)]
         if brightness_pct <= 0:
-            packets.extend(
-                [
-                    build_ble_segment_color_packet(0, 0, 0, segment_mask),
-                    build_ble_segment_color_v2_packet(0, 0, 0, segment_mask),
-                ]
-            )
+            packets = [build_ble_segment_color_packet(0, 0, 0, segment_mask)]
+        else:
+            packets = [build_ble_segment_brightness_packet(brightness_pct, segment_mask)]
         return await self._dispatch_ptreal_packets(packets)
 
-    async def async_set_scene(self, scene_id: int) -> str:
+    async def async_set_scene(
+        self, scene_id: int, scene_param_b64: str | None = None
+    ) -> str:
         """Activate a native Govee hardware scene via `ptReal` / BLE."""
-        return await self._dispatch_ptreal_packets([build_ble_scene_packet(scene_id)])
+        packets = build_ble_multipacket_scene_packets(scene_id, scene_param_b64)
+        return await self._dispatch_ptreal_packets(packets)
 
     async def async_set_music_mode(self, mode_id: int, sensitivity: int = 50) -> str:
         """Activate a native Govee onboard music mode via `ptReal` / BLE."""

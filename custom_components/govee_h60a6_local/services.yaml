@@ -1,6 +1,6 @@
 set_segment_color:
   name: Set segment color
-  description: Set RGB color and optional brightness on specific ambient ring segments (1-12) of the Govee H60A6 via local ptReal/BLE packets.
+  description: Set RGB color and optional brightness on specific segments 1-13 (1-12 = ambient ring, 13 = main center) of the Govee H60A6 via local ptReal/BLE packets.
   fields:
     entry_id:
       name: Config entry ID
@@ -9,7 +9,7 @@ set_segment_color:
         text:
     segments:
       name: Segments
-      description: List of 1-based ring segment numbers (1 to 12).
+      description: List of 1-based segment numbers 1-13 (1-12 = ambient ring, 13 = main center).
       required: true
       example: [1, 2, 3, 4]
       selector:

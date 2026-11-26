@@ -128,6 +128,7 @@ def _install_ha_stubs() -> None:
     _make_mod("homeassistant.helpers.config_validation")
     _make_mod("homeassistant.helpers.device_registry")
     _make_mod("homeassistant.helpers.entity_platform")
+    _make_mod("homeassistant.helpers.restore_state")
     _make_mod("homeassistant.helpers.update_coordinator")
     _make_mod("homeassistant.components")
     _make_mod("homeassistant.components.light")
@@ -235,6 +236,17 @@ def _install_ha_stubs() -> None:
 
     uc_mod.DataUpdateCoordinator = DataUpdateCoordinator
     uc_mod.CoordinatorEntity = CoordinatorEntity
+
+    rs_mod = sys.modules["homeassistant.helpers.restore_state"]
+
+    class RestoreEntity:
+        async def async_added_to_hass(self) -> None:
+            return None
+
+        async def async_get_last_state(self) -> Any:
+            return None
+
+    rs_mod.RestoreEntity = RestoreEntity
 
     # light, sensor, button
     light_mod = sys.modules["homeassistant.components.light"]
@@ -350,7 +362,7 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await client.async_set_segment_color(255, 0, 128, 0x0FFF), "ble"
         )
-        self.assertGreaterEqual(len(fake_ble.written), 2)
+        self.assertGreaterEqual(len(fake_ble.written), 1)
         ble_writes_before_outage = len(fake_ble.written)
 
         # 4. Simulate Wi-Fi outage -> 2 failed devStatus polls trigger BLE fallback
@@ -363,8 +375,9 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(used, "ble")
         self.assertEqual(len(fake_ble.written), ble_writes_before_outage + 1)
         self.assertEqual(
-            fake_ble.written[-1][1][:6], bytes([0x33, 0x05, 0x02, 255, 50, 0])
+            fake_ble.written[-1][1][:7], bytes([0x33, 0x05, 0x15, 0x01, 255, 50, 0])
         )
+        self.assertEqual(fake_ble.written[-1][1][12:14], bytes([0xFF, 0x1F]))
 
         # 5. Wi-Fi recovers -> devStatus succeeds and switches back to Wi-Fi!
         self.mock_device.drop_packets = False
@@ -397,6 +410,7 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
         )
         from custom_components.govee_h60a6_local.coordinator import GoveeH60A6Coordinator
         from custom_components.govee_h60a6_local.light import (
+            GoveeH60A6CenterLight,
             GoveeH60A6MainLight,
             GoveeH60A6RingLight,
             GoveeH60A6SegmentLight,
@@ -421,6 +435,7 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
         await coord.async_request_refresh()
 
         main_light = GoveeH60A6MainLight(coord)
+        center_light = GoveeH60A6CenterLight(coord)
         ring_light = GoveeH60A6RingLight(coord)
         seg3_light = GoveeH60A6SegmentLight(coord, 3)
         transport_sensor = GoveeH60A6TransportSensor(coord)
@@ -452,13 +467,42 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
 
         await seg3_light.async_turn_on(**{ATTR_RGB_COLOR: (255, 180, 0), ATTR_BRIGHTNESS: 128})
         self.assertEqual(seg3_light.rgb_color, (255, 180, 0))
+
+        # Control main center panel (segment 13, mask 0x1000 -> LE 00 10; 191/255 = 75% scales RGB)
+        import base64
+
+        await center_light.async_turn_on(**{ATTR_RGB_COLOR: (64, 128, 255), ATTR_BRIGHTNESS: 191})
+        self.assertTrue(center_light.is_on)
+        self.assertEqual(center_light.rgb_color, (64, 128, 255))
+        self.assertEqual(coord.state.segments[12].rgb, (64, 128, 255))
+        self.assertEqual(coord.state.segments[12].brightness, 75)
         await asyncio.sleep(0.05)
         ptreal_cmds = [m for m in self.mock_device.received_commands if m["cmd"] == "ptReal"]
-        self.assertGreaterEqual(len(ptreal_cmds), 2)
+        self.assertGreaterEqual(len(ptreal_cmds), 3)
+        decoded_ptreal = [
+            base64.b64decode(m["data"]["command"][0]) for m in ptreal_cmds
+        ]
+        self.assertTrue(
+            any(
+                pkt[0:7] == bytes([0x33, 0x05, 0x15, 0x01, 48, 96, 191])
+                and pkt[12:14] == bytes([0x00, 0x10])
+                for pkt in decoded_ptreal
+            )
+        )
+        await center_light.async_turn_off()
+        self.assertFalse(center_light.is_on)
+        self.assertFalse(coord.state.segments[12].is_on)
 
-        # Start native hardware scene effect, then stop via button
-        await main_light.async_turn_on(**{ATTR_EFFECT: "Scene: Aurora"})
-        self.assertEqual(main_light.effect, "Scene: Aurora")
+        # Verify all 75 scene_param-backed scenes (0xA3 + single/multi-chunk 0xA4) are exposed while no-param scenes remain omitted
+        self.assertIn("Scene: Sunrise", main_light.effect_list)
+        self.assertIn("Scene: Aurora", main_light.effect_list)
+        self.assertIn("Scene: Rainbow", main_light.effect_list)
+        self.assertIn("Scene: Ocean", main_light.effect_list)
+        self.assertNotIn("Scene: Illumination", main_light.effect_list)
+        await main_light.async_turn_on(**{ATTR_EFFECT: "Scene: Rainbow"})
+        self.assertEqual(main_light.effect, "Scene: Rainbow")
+        await main_light.async_turn_on(**{ATTR_EFFECT: "Aurora Pulse"})
+        self.assertEqual(main_light.effect, "Aurora Pulse")
         await stop_btn.async_press()
         self.assertIsNone(main_light.effect)
 
@@ -470,6 +514,171 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
 
         # Refresh button syncs cleanly from emulated device
         await refresh_btn.async_press()
+        await coord.async_shutdown_tasks()
+
+    async def test_segment_and_ring_remember_color_across_off_on(self) -> None:
+        """Turning a segment or ambient ring off and on remembers its previous color & brightness."""
+        import base64
+        from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_RGB_COLOR
+        from homeassistant.config_entries import ConfigEntry
+        from homeassistant.core import HomeAssistant
+
+        from custom_components.govee_h60a6_local.const import (
+            CONF_HOST,
+            CONF_TRANSPORT_MODE,
+            TRANSPORT_WIFI_ONLY,
+        )
+        from custom_components.govee_h60a6_local.coordinator import GoveeH60A6Coordinator
+        from custom_components.govee_h60a6_local.light import (
+            GoveeH60A6CenterLight,
+            GoveeH60A6MainLight,
+            GoveeH60A6RingLight,
+            GoveeH60A6SegmentLight,
+        )
+        from custom_components.govee_h60a6_local.transport import GoveeH60A6Client
+
+        hass = HomeAssistant()
+        entry = ConfigEntry(
+            entry_id="test_memory",
+            data={CONF_HOST: "127.0.0.1", CONF_TRANSPORT_MODE: TRANSPORT_WIFI_ONLY},
+            unique_id="h60a6_memory",
+        )
+        client = GoveeH60A6Client(
+            host="127.0.0.1",
+            hub=self.hub,
+            transport_mode=TRANSPORT_WIFI_ONLY,
+            command_delay_ms=0,
+            lan_timeout=0.5,
+        )
+        coord = GoveeH60A6Coordinator(hass, entry, client, poll_interval=60)
+        await coord.async_request_refresh()
+
+        main_light = GoveeH60A6MainLight(coord)
+        center_light = GoveeH60A6CenterLight(coord)
+        ring_light = GoveeH60A6RingLight(coord)
+        seg1_light = GoveeH60A6SegmentLight(coord, 1)
+        seg2_light = GoveeH60A6SegmentLight(coord, 2)
+        seg3_light = GoveeH60A6SegmentLight(coord, 3)
+
+        # 1. Setting whole-light RGB syncs segments so turning seg 3 off/on keeps RED, not white
+        await main_light.async_turn_on(**{ATTR_RGB_COLOR: (255, 0, 0)})
+        await seg3_light.async_turn_off()
+        self.mock_device.received_commands.clear()
+        await seg3_light.async_turn_on()
+        await asyncio.sleep(0.05)
+        ptreal_pkts = [
+            base64.b64decode(m["data"]["command"][0])
+            for m in self.mock_device.received_commands
+            if m["cmd"] == "ptReal"
+        ]
+        self.assertTrue(
+            any(
+                pkt[0:7] == bytes([0x33, 0x05, 0x15, 0x01, 255, 0, 0])
+                and pkt[12:14] == bytes([0x04, 0x00])
+                for pkt in ptreal_pkts
+            )
+        )
+
+        # 2. Setting seg 3 to custom RGB + 50% brightness, turning OFF, then ON restores it
+        await seg3_light.async_turn_on(**{ATTR_RGB_COLOR: (0, 255, 128), ATTR_BRIGHTNESS: 128})
+        await seg3_light.async_turn_off()
+        self.mock_device.received_commands.clear()
+        await seg3_light.async_turn_on()
+        await asyncio.sleep(0.05)
+        self.assertEqual(seg3_light.rgb_color, (0, 255, 128))
+        self.assertEqual(coord.state.segments[2].brightness, 50)
+        ptreal_pkts = [
+            base64.b64decode(m["data"]["command"][0])
+            for m in self.mock_device.received_commands
+            if m["cmd"] == "ptReal"
+        ]
+        # 50% of (0, 255, 128) = (0, 128, 64) on segment 3 (bitmask 0x0004 -> 04 00)
+        self.assertTrue(
+            any(
+                pkt[0:7] == bytes([0x33, 0x05, 0x15, 0x01, 0, 128, 64])
+                and pkt[12:14] == bytes([0x04, 0x00])
+                for pkt in ptreal_pkts
+            )
+        )
+
+        # 3. Ring off/on restores per-segment colors (seg1=RED, seg2=BLUE) & leaves center untouched
+        await center_light.async_turn_on(**{ATTR_RGB_COLOR: (10, 20, 30), ATTR_BRIGHTNESS: 255})
+        await seg1_light.async_turn_on(**{ATTR_RGB_COLOR: (255, 0, 0), ATTR_BRIGHTNESS: 255})
+        await seg2_light.async_turn_on(**{ATTR_RGB_COLOR: (0, 0, 255), ATTR_BRIGHTNESS: 255})
+        await ring_light.async_turn_off()
+        self.assertTrue(center_light.is_on)
+        self.assertEqual(center_light.rgb_color, (10, 20, 30))
+
+        self.mock_device.received_commands.clear()
+        await ring_light.async_turn_on()
+        await asyncio.sleep(0.05)
+        self.assertEqual(seg1_light.rgb_color, (255, 0, 0))
+        self.assertEqual(seg2_light.rgb_color, (0, 0, 255))
+        self.assertEqual(center_light.rgb_color, (10, 20, 30))
+        ptreal_pkts = [
+            base64.b64decode(m["data"]["command"][0])
+            for m in self.mock_device.received_commands
+            if m["cmd"] == "ptReal"
+        ]
+        self.assertTrue(
+            any(
+                pkt[0:7] == bytes([0x33, 0x05, 0x15, 0x01, 0, 0, 255])
+                and (int.from_bytes(pkt[12:14], "little") & 0x0002)
+                for pkt in ptreal_pkts
+            )
+        )
+
+        # 4. Center & Ring Kelvin white-channel control & off/on memory
+        from homeassistant.components.light import ATTR_COLOR_TEMP_KELVIN, ColorMode
+
+        self.mock_device.received_commands.clear()
+        await center_light.async_turn_on(**{ATTR_COLOR_TEMP_KELVIN: 4000, ATTR_BRIGHTNESS: 255})
+        self.assertEqual(center_light.color_mode, ColorMode.COLOR_TEMP)
+        self.assertEqual(center_light.color_temp_kelvin, 4000)
+        self.assertIsNone(center_light.rgb_color)
+        await center_light.async_turn_off()
+        self.mock_device.received_commands.clear()
+        await center_light.async_turn_on()
+        await asyncio.sleep(0.05)
+        self.assertEqual(center_light.color_mode, ColorMode.COLOR_TEMP)
+        self.assertEqual(center_light.color_temp_kelvin, 4000)
+        ptreal_pkts = [
+            base64.b64decode(m["data"]["command"][0])
+            for m in self.mock_device.received_commands
+            if m["cmd"] == "ptReal"
+        ]
+        # 4000 == 0x0FA0 on segment 13 (0x1000 -> LE 00 10)
+        self.assertTrue(
+            any(
+                pkt[0:9] == bytes([0x33, 0x05, 0x15, 0x01, 0, 0, 0, 0x0F, 0xA0])
+                and pkt[12:14] == bytes([0x00, 0x10])
+                for pkt in ptreal_pkts
+            )
+        )
+
+        await ring_light.async_turn_on(**{ATTR_COLOR_TEMP_KELVIN: 2700})
+        self.assertEqual(ring_light.color_mode, ColorMode.COLOR_TEMP)
+        self.assertEqual(ring_light.color_temp_kelvin, 2700)
+
+        # Regression: after setting whole-light & ring Kelvin, toggling individual seg 3
+        # OFF/ON must emit only single-segment RGB (00 00 kelvin, bitmask 0x0004), never 33 05 15 02
+        await main_light.async_turn_on(**{ATTR_COLOR_TEMP_KELVIN: 4000})
+        await ring_light.async_turn_on(**{ATTR_COLOR_TEMP_KELVIN: 2700})
+        await seg3_light.async_turn_off()
+        await asyncio.sleep(0.05)
+        self.mock_device.received_commands.clear()
+        await seg3_light.async_turn_on()
+        await asyncio.sleep(0.05)
+        ptreal_pkts = [
+            base64.b64decode(m["data"]["command"][0])
+            for m in self.mock_device.received_commands
+            if m["cmd"] == "ptReal"
+        ]
+        self.assertEqual(len(ptreal_pkts), 1)
+        self.assertEqual(ptreal_pkts[0][0:4], bytes([0x33, 0x05, 0x15, 0x01]))
+        self.assertEqual(ptreal_pkts[0][7:9], bytes([0x00, 0x00]))
+        self.assertEqual(ptreal_pkts[0][12:14], bytes([0x04, 0x00]))
+        self.assertFalse(any(pkt[0:4] == bytes([0x33, 0x05, 0x15, 0x02]) for pkt in ptreal_pkts))
         await coord.async_shutdown_tasks()
 
     async def test_port_in_use_falls_back_to_wifi_send_only(self) -> None:
@@ -518,6 +727,147 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
         finally:
             await hub.async_stop(force=True)
             busy_sock.close()
+
+    async def test_ring_segment_sync_ble_failure_whole_light_and_restore(self) -> None:
+        """Verify BLE errors do not fall back to Wi-Fi ptReal, whole-light/devStatus updates sync segments, and RestoreEntity handles restart while OFF."""
+        from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_RGB_COLOR
+        from homeassistant.config_entries import ConfigEntry
+        from homeassistant.core import HomeAssistant
+
+        from custom_components.govee_h60a6_local.const import (
+            CONF_BLE_ADDRESS,
+            CONF_HOST,
+            CONF_TRANSPORT_MODE,
+            TRANSPORT_WIFI_PREFERRED,
+        )
+        from custom_components.govee_h60a6_local.coordinator import GoveeH60A6Coordinator
+        from custom_components.govee_h60a6_local.light import (
+            GoveeH60A6MainLight,
+            GoveeH60A6RingLight,
+            GoveeH60A6SegmentLight,
+        )
+        from custom_components.govee_h60a6_local.transport import (
+            GoveeBleTransport,
+            GoveeH60A6Client,
+            GoveeTransportError,
+        )
+
+        class FailingBleClient(FakeBleClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_writes = True
+
+            async def write_gatt_char(
+                self, uuid: str, data: bytes, response: bool = False
+            ) -> None:
+                if self.fail_writes:
+                    raise RuntimeError("BLE write timed out")
+                await super().write_gatt_char(uuid, data, response=response)
+
+        fake_ble = FailingBleClient()
+        ble_transport = GoveeBleTransport(
+            "AA:BB:CC:DD:EE:FF",
+            idle_timeout=0,
+            client_factory=lambda: fake_ble,
+        )
+        hass = HomeAssistant()
+        entry = ConfigEntry(
+            entry_id="test_sync",
+            data={
+                CONF_HOST: "127.0.0.1",
+                CONF_BLE_ADDRESS: "AA:BB:CC:DD:EE:FF",
+                CONF_TRANSPORT_MODE: TRANSPORT_WIFI_PREFERRED,
+            },
+            unique_id="h60a6_sync",
+        )
+        client = GoveeH60A6Client(
+            host="127.0.0.1",
+            hub=self.hub,
+            ble_transport=ble_transport,
+            transport_mode=TRANSPORT_WIFI_PREFERRED,
+            command_delay_ms=0,
+            lan_timeout=0.5,
+        )
+        coord = GoveeH60A6Coordinator(hass, entry, client, poll_interval=60)
+        self.mock_device.on_off = 1
+        await coord.async_request_refresh()
+
+        main_light = GoveeH60A6MainLight(coord)
+        ring_light = GoveeH60A6RingLight(coord)
+        seg3_light = GoveeH60A6SegmentLight(coord, 3)
+
+        # 1. Failing BLE write must raise GoveeTransportError, NOT emit Wi-Fi ptReal,
+        # and leave seg3_light.is_on unchanged (True).
+        self.mock_device.received_commands.clear()
+        with self.assertRaises(GoveeTransportError):
+            await seg3_light.async_turn_off()
+        await asyncio.sleep(0.05)
+        self.assertFalse(
+            any(m["cmd"] == "ptReal" for m in self.mock_device.received_commands)
+        )
+        self.assertTrue(seg3_light.is_on)
+
+        # 2. Succeeding BLE turn-off updates seg3, then whole-light RGB turns seg3 & ring back ON at 100%
+        fake_ble.fail_writes = False
+        await seg3_light.async_turn_on(**{ATTR_RGB_COLOR: (10, 20, 30), ATTR_BRIGHTNESS: 64})
+        await seg3_light.async_turn_off()
+        await ring_light.async_turn_off()
+        self.assertFalse(seg3_light.is_on)
+        self.assertFalse(ring_light.is_on)
+
+        await main_light.async_turn_on(**{ATTR_RGB_COLOR: (0, 200, 255)})
+        await asyncio.sleep(0.05)
+        self.assertTrue(ring_light.is_on)
+        self.assertTrue(seg3_light.is_on)
+        self.assertEqual(seg3_light.rgb_color, (0, 200, 255))
+        self.assertEqual(coord.state.segments[2].brightness, 100)
+
+        # 3. External devStatus color change re-syncs ring and segments
+        await seg3_light.async_turn_off()
+        self.assertFalse(seg3_light.is_on)
+        self.mock_device.color = {"r": 255, "g": 100, "b": 0}
+        self.mock_device.kelvin = 0
+        await coord.async_request_refresh()
+        self.assertTrue(seg3_light.is_on)
+        self.assertEqual(seg3_light.rgb_color, (255, 100, 0))
+        self.assertEqual(coord.state.segments[2].brightness, 100)
+
+        # 4. RestoreEntity while main light is OFF:
+        #    without segment_enabled, seg3 stays ON; with segment_enabled=False, it honors False.
+        coord.state.is_on = False
+        coord.state.segments[2].is_on = True
+        mock_last_state = types.SimpleNamespace(
+            state="off",
+            attributes={"rgb_color": (12, 34, 56), "brightness": 128},
+        )
+
+        async def _get_last_no_flag() -> Any:
+            return mock_last_state
+
+        seg3_light.async_get_last_state = _get_last_no_flag  # type: ignore[method-assign]
+        await seg3_light.async_added_to_hass()
+        self.assertTrue(coord.state.segments[2].is_on)
+        self.assertEqual(seg3_light.rgb_color, (12, 34, 56))
+        self.assertEqual(seg3_light.extra_state_attributes, {"segment_enabled": True})
+
+        mock_last_state_disabled = types.SimpleNamespace(
+            state="off",
+            attributes={
+                "rgb_color": (12, 34, 56),
+                "brightness": 128,
+                "segment_enabled": False,
+            },
+        )
+
+        async def _get_last_disabled() -> Any:
+            return mock_last_state_disabled
+
+        seg3_light.async_get_last_state = _get_last_disabled  # type: ignore[method-assign]
+        await seg3_light.async_added_to_hass()
+        self.assertFalse(coord.state.segments[2].is_on)
+        self.assertEqual(seg3_light.extra_state_attributes, {"segment_enabled": False})
+
+        await coord.async_shutdown_tasks()
 
 
 if __name__ == "__main__":
