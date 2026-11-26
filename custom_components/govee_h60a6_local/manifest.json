@@ -1,0 +1,14 @@
+{
+  "domain": "govee_h60a6_local",
+  "name": "Govee H60A6 Local",
+  "after_dependencies": ["bluetooth"],
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/local/govee_h60a6_local",
+  "iot_class": "local_polling",
+  "requirements": [
+    "bleak>=0.21.0",
+    "bleak-retry-connector>=3.5.0"
+  ],
+  "version": "1.0.0"
+}

@@ -1,0 +1,118 @@
+set_segment_color:
+  name: Set segment color
+  description: Set RGB color and optional brightness on specific ambient ring segments (1-12) of the Govee H60A6 via local ptReal/BLE packets.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID if you have multiple H60A6 lights configured.
+      selector:
+        text:
+    segments:
+      name: Segments
+      description: List of 1-based ring segment numbers (1 to 12).
+      required: true
+      example: [1, 2, 3, 4]
+      selector:
+        object:
+    rgb_color:
+      name: RGB color
+      description: Target RGB color as [R, G, B] (0-255).
+      required: true
+      example: [255, 64, 0]
+      selector:
+        color_rgb:
+    brightness_pct:
+      name: Brightness percentage
+      description: Optional segment brightness from 0 (off) to 100.
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+
+send_scene:
+  name: Activate hardware scene
+  description: Trigger a native Govee hardware scene ID locally via ptReal (33 05 04 <id>) or BLE.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID.
+      selector:
+        text:
+    scene_id:
+      name: Scene ID
+      description: Numeric Govee scene ID (0-65535).
+      required: true
+      example: 4
+      selector:
+        number:
+          min: 0
+          max: 65535
+
+send_music_mode:
+  name: Activate music mode
+  description: Activate an onboard Govee music reactive mode locally via ptReal (33 05 13) or BLE.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID.
+      selector:
+        text:
+    mode_id:
+      name: Music mode ID
+      description: Numeric music profile ID (0-255).
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 0
+          max: 255
+    sensitivity:
+      name: Sensitivity
+      description: Microphone reactivity sensitivity (1-100).
+      default: 50
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+
+send_raw_ptreal:
+  name: Send raw ptReal / BLE command
+  description: Send one or more hex-encoded Govee BLE frames (auto-padded to 20 bytes with XOR checksum) over LAN ptReal or BLE.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID.
+      selector:
+        text:
+    commands:
+      name: Hex commands
+      description: List of hex strings (e.g. ["33 05 04 04"]).
+      required: true
+      example: ["33 05 04 04"]
+      selector:
+        object:
+
+set_razer_segments:
+  name: Stream Razer/DreamView segment colors
+  description: Push a list of RGB color tuples directly to the H60A6 over local UDP Razer/DreamView protocol (Wi-Fi LAN only).
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID.
+      selector:
+        text:
+    colors:
+      name: Segment RGB colors
+      description: Ordered list of [R, G, B] triples.
+      required: true
+      example: [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+      selector:
+        object:
+    gradient:
+      name: Smooth gradient interpolation
+      description: Blend transitions smoothly between segments.
+      default: true
+      selector:
+        boolean:

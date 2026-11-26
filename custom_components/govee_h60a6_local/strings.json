@@ -1,0 +1,77 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Govee H60A6 Local Setup",
+        "description": "Connect to your Govee H60A6 Ceiling Light Pro 100% locally. Make sure LAN Control is enabled in the Govee Home app for Wi-Fi control.",
+        "menu_options": {
+          "manual": "Manual IP / Bluetooth setup",
+          "discover": "Auto-discover Govee lights on local network"
+        }
+      },
+      "discover": {
+        "title": "Select Discovered Govee Light",
+        "description": "Choose a discovered device and optionally add a Bluetooth MAC address for automatic fallback.",
+        "data": {
+          "host": "Discovered Device",
+          "name": "Name",
+          "ble_address": "Bluetooth MAC Address (optional fallback)",
+          "transport_mode": "Transport Preference",
+          "enable_segments": "Expose 12 individual ring segment light entities"
+        }
+      },
+      "manual": {
+        "title": "Configure Govee H60A6 Local",
+        "description": "Enter your H60A6 local IP address. Optionally supply its Bluetooth MAC address for fallback control. Nearby Govee BLE devices: {ble_hint}.",
+        "data": {
+          "name": "Name",
+          "host": "Wi-Fi IP Address",
+          "ble_address": "Bluetooth MAC Address (optional fallback)",
+          "transport_mode": "Transport Preference",
+          "enable_segments": "Expose 12 individual ring segment light entities",
+          "listen_port": "Local UDP Listen Port (default 4002)",
+          "skip_validation": "Skip live connection check (add offline)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the Govee H60A6 over LAN UDP. Verify the IP address and ensure 'LAN Control' is toggled on in the Govee Home app (or enable 'Skip live connection check').",
+      "no_devices_found": "No Govee LAN devices replied to multicast scan. You can configure the IP manually below.",
+      "port_in_use": "UDP port 4002 is already bound by another process (such as govee2mqtt). Stop the conflicting service or choose another port.",
+      "invalid_mac": "Invalid Bluetooth MAC address format (expected AA:BB:CC:DD:EE:FF).",
+      "ble_required": "Bluetooth MAC address is required when Transport Preference is set to BLE only.",
+      "host_required": "Wi-Fi IP address is required when Wi-Fi transport is selected."
+    },
+    "abort": {
+      "already_configured": "This Govee H60A6 device is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Govee H60A6 Local Options",
+        "description": "Adjust network/Bluetooth fallback settings, polling cadence, and segment exposure.",
+        "data": {
+          "host": "Wi-Fi IP Address",
+          "ble_address": "Bluetooth MAC Address (optional fallback)",
+          "transport_mode": "Transport Preference",
+          "poll_interval": "Status Poll Interval (seconds)",
+          "command_delay_ms": "Minimum Delay Between Wi-Fi Commands (ms)",
+          "enable_segments": "Expose 12 individual ring segment light entities"
+        }
+      }
+    },
+    "error": {
+      "invalid_mac": "Invalid Bluetooth MAC address format (expected AA:BB:CC:DD:EE:FF)."
+    }
+  },
+  "selector": {
+    "transport_mode": {
+      "options": {
+        "wifi_preferred": "Wi-Fi LAN preferred (Bluetooth LE fallback)",
+        "wifi_only": "Wi-Fi LAN only",
+        "ble_only": "Bluetooth LE only"
+      }
+    }
+  }
+}
