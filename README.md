@@ -1,5 +1,8 @@
 # Govee H60A6 Local — Home Assistant Integration
 
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository?owner=steku&repository=govee-h60a6-local&category=integration)
+[![Open your Home Assistant instance and start the setup of a specific integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start?domain=govee_h60a6_local)
+
 100% local Home Assistant custom integration for the **Govee 15-Inch RGBICWW Smart Ceiling Light Pro (`H60A6`)**, with **Wi-Fi LAN preferred** (UDP ports `4001`–`4003`) and **Bluetooth LE** control/fallback via Home Assistant's native Bluetooth stack.
 
 No Govee Cloud account, API key, or internet access is required at runtime.
@@ -66,7 +69,14 @@ No Govee Cloud account, API key, or internet access is required at runtime.
 5. *(Recommended)* Enter the H60A6's Bluetooth MAC address for Ambient Ring, Main Center, ring segments, native scenes, and automatic BLE fallback.
 
 ### Option B: HACS (Custom Repository)
-Push this repository to GitHub, add it as a Custom Repository in HACS (category: **Integration**), install **Govee H60A6 Local**, and restart Home Assistant.
+
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository?owner=steku&repository=govee-h60a6-local&category=integration)
+
+1. Click the **Open repository in HACS** button above (or open **HACS -> 3-dots menu -> Custom repositories**, add `https://github.com/steku/govee-h60a6-local` with category **Integration**).
+2. Download **Govee H60A6 Local** and restart Home Assistant.
+3. Click the **Add Integration** button below (or go to **Settings -> Devices & Services -> Add Integration** and search for **Govee H60A6 Local**):
+
+[![Open your Home Assistant instance and start the setup of a specific integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start?domain=govee_h60a6_local)
 
 ---
 
