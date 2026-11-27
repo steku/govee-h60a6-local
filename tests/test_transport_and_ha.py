@@ -980,6 +980,78 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
 
         await coord.async_shutdown_tasks()
 
+    async def test_main_light_turn_on_reliability(self) -> None:
+        """Main light turn_on sends redundant UDP power and restores illumination if all segments were off."""
+        from homeassistant.config_entries import ConfigEntry
+        from homeassistant.core import HomeAssistant
+
+        from custom_components.govee_h60a6_local.const import (
+            CONF_HOST,
+            CONF_TRANSPORT_MODE,
+            TRANSPORT_WIFI_ONLY,
+        )
+        from custom_components.govee_h60a6_local.coordinator import GoveeH60A6Coordinator
+        from custom_components.govee_h60a6_local.light import (
+            GoveeH60A6CenterLight,
+            GoveeH60A6MainLight,
+            GoveeH60A6RingLight,
+        )
+        from custom_components.govee_h60a6_local.transport import GoveeH60A6Client
+
+        hass = HomeAssistant()
+        entry = ConfigEntry(
+            entry_id="test_reliability",
+            data={CONF_HOST: "127.0.0.1", CONF_TRANSPORT_MODE: TRANSPORT_WIFI_ONLY},
+            unique_id="h60a6_reliability",
+        )
+        client = GoveeH60A6Client(
+            host="127.0.0.1",
+            hub=self.hub,
+            transport_mode=TRANSPORT_WIFI_ONLY,
+            command_delay_ms=0,
+            lan_timeout=0.5,
+        )
+        coord = GoveeH60A6Coordinator(hass, entry, client, poll_interval=60)
+        await coord.async_request_refresh()
+
+        main_light = GoveeH60A6MainLight(coord)
+        center_light = GoveeH60A6CenterLight(coord)
+        ring_light = GoveeH60A6RingLight(coord)
+
+        # 1. Wi-Fi turn(True) sends 2 UDP turn packets for sleep-wake reliability
+        self.mock_device.received_commands.clear()
+        await client.async_turn(True)
+        await asyncio.sleep(0.05)
+        turn_cmds = [
+            m for m in self.mock_device.received_commands if m["cmd"] == "turn"
+        ]
+        self.assertEqual(len(turn_cmds), 2)
+        self.assertTrue(all(m["data"]["value"] == 1 for m in turn_cmds))
+
+        # 2. Turning off both ring and center, turning main off, then turning main back ON
+        #    sends `turn(1)` + `colorwc` to restore illumination instead of staying black
+        await ring_light.async_turn_off()
+        await center_light.async_turn_off()
+        await main_light.async_turn_off()
+        await asyncio.sleep(0.05)
+        self.assertFalse(ring_light.is_on)
+        self.assertFalse(center_light.is_on)
+
+        self.mock_device.received_commands.clear()
+        await main_light.async_turn_on()
+        await asyncio.sleep(0.05)
+        self.assertTrue(main_light.is_on)
+        self.assertTrue(ring_light.is_on)
+        self.assertTrue(center_light.is_on)
+        self.assertTrue(
+            any(m["cmd"] == "turn" and m["data"]["value"] == 1 for m in self.mock_device.received_commands)
+        )
+        self.assertTrue(
+            any(m["cmd"] == "colorwc" for m in self.mock_device.received_commands)
+        )
+
+        await coord.async_shutdown_tasks()
+
 
 if __name__ == "__main__":
     unittest.main()

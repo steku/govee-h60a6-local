@@ -762,11 +762,19 @@ class GoveeH60A6Client:
         return parse_ble_status_frames(frames)
 
     async def async_turn(self, is_on: bool) -> str:
-        """Turn the H60A6 on or off."""
-        return await self._dispatch(
-            build_turn_payload(is_on),
+        """Turn the H60A6 on or off (sending a second UDP datagram over Wi-Fi for wake reliability)."""
+        payload = build_turn_payload(is_on)
+        used = await self._dispatch(
+            payload,
             [build_ble_power_packet(is_on)],
         )
+        if used == "wifi":
+            async with self._cmd_lock:
+                try:
+                    await self._send_wifi_payload(payload)
+                except Exception:
+                    pass
+        return used
 
     async def async_set_brightness(self, brightness_pct: int) -> str:
         """Set overall brightness (1..100%)."""

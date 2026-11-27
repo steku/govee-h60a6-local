@@ -398,15 +398,31 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
             self._notify_state()
             return
 
-        if not self.state.is_on or (
-            brightness_pct is None and rgb is None and color_temp_kelvin is None
+        all_segments_off = not any(seg.is_on for seg in self.state.segments)
+        if (
+            not self.state.is_on
+            or self.client.active_transport != "wifi"
+            or (brightness_pct is None and rgb is None and color_temp_kelvin is None)
         ):
             await self.client.async_turn(True)
             self.state.is_on = True
-            if not any(seg.is_on for seg in self.state.segments):
+            if all_segments_off:
                 self.state.ring.is_on = True
                 for seg in self.state.segments:
                     seg.is_on = True
+
+        if all_segments_off and rgb is None and color_temp_kelvin is None:
+            if self.state.color_temp_kelvin > 0:
+                await self.client.async_set_color_temp(self.state.color_temp_kelvin)
+                self._sync_segments_color(
+                    kelvin_to_rgb(self.state.color_temp_kelvin),
+                    color_temp_kelvin=self.state.color_temp_kelvin,
+                    mark_on=True,
+                )
+            else:
+                await self.client.async_set_rgb(*self.state.rgb)
+                self._sync_segments_color(self.state.rgb, mark_on=True)
+            self._segments_initialized = True
 
         if rgb is not None:
             r, g, b = clamp(rgb[0], 0, 255), clamp(rgb[1], 0, 255), clamp(rgb[2], 0, 255)
