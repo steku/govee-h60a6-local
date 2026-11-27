@@ -120,14 +120,23 @@ class TestGoveeProtocol(unittest.TestCase):
         self.assertEqual(rgb_pkt[0:7], bytes([0x33, 0x05, 0x15, 0x01, 255, 0, 128]))
         self.assertEqual(rgb_pkt[12:14], bytes([0xFF, 0x1F]))
 
-        # Verify dedicated WW/CW Kelvin packet uses 33 05 15 01 00 00 00 <k_hi> <k_lo> <wr wg wb> <mask_lo mask_hi>
+        # Verify dedicated WW/CW Kelvin packet matches Govee app capture:
+        # 33 05 15 01 FF FF FF <k_hi> <k_lo> <wr wg wb> <mask_lo mask_hi>
         k2700 = protocol.build_ble_color_temp_packet(2700)
         wr, wg, wb = protocol.kelvin_to_rgb(2700)
-        self.assertEqual(k2700[0:7], bytes([0x33, 0x05, 0x15, 0x01, 0, 0, 0]))
+        self.assertEqual(k2700[0:7], bytes([0x33, 0x05, 0x15, 0x01, 0xFF, 0xFF, 0xFF]))
         self.assertEqual(k2700[7:9], bytes([0x0A, 0x8C]))  # 2700 = 0x0A8C
         self.assertEqual(k2700[9:12], bytes([wr, wg, wb]))
         self.assertEqual(k2700[12:14], bytes([0xFF, 0x1F]))
         self.assertEqual(k2700[19], protocol.compute_xor_checksum(k2700[:19]))
+
+        k4000 = protocol.build_ble_color_temp_packet(4000)
+        self.assertEqual(
+            k4000[0:9],
+            bytes([0x33, 0x05, 0x15, 0x01, 0xFF, 0xFF, 0xFF, 0x0F, 0xA0]),
+        )
+        self.assertEqual(k4000[12:14], bytes([0xFF, 0x1F]))
+        self.assertEqual(k4000[19], protocol.compute_xor_checksum(k4000[:19]))
 
         k6500_center = protocol.build_ble_segment_color_temp_packet(6500, 0x1000)
         self.assertEqual(k6500_center[7:9], bytes([0x19, 0x64]))  # 6500 = 0x1964
@@ -448,6 +457,82 @@ class TestGoveeProtocol(unittest.TestCase):
             ocean_frames[2].hex(),
             "330504884a0000000000000000000000000000f0",
         )
+
+    def test_ble_status_query_and_parser(self) -> None:
+        query_pkt = protocol.build_ble_status_query_packet()
+        self.assertEqual(query_pkt.hex(), "ac03034130a50000000000000000000000000078")
+
+        # 1. 4000K white @ 50% (real H60A6 capture)
+        frames_4000k = [
+            bytes.fromhex(h)
+            for h in (
+                "ac000a000c0300010101040132050415010fa025",
+                "ac01070706b5e77e6813d4071110b4e77e681378",
+                "ac02d4ea3b0100310104030000070d11d4136829",
+                "ac037ee7b40100310104031104001e0f0f1207aa",
+                "ac0400640000800f002310000000800000008070",
+                "ac0500000080000000804102020130020101a57e",
+                "ac06110164ffd5a164ffd5a164ffd5a128ffd557",
+                "ac07a1a5110228ffd5a128ffd5a128ffd5a12837",
+                "ac08ffd5a1a5110364ffd5a128ffd5a128ffd5d6",
+                "acffa128ffd5a1a5050401ffd5a100000000007f",
+            )
+        ]
+        st_4k = protocol.parse_ble_status_frames(frames_4000k)
+        assert st_4k is not None
+        self.assertTrue(st_4k.is_on)
+        self.assertEqual(st_4k.brightness, 50)
+        self.assertEqual(st_4k.color_temp_kelvin, 4000)
+        self.assertIsNone(st_4k.scene_code)
+        self.assertEqual(len(st_4k.ring_segments), 12)
+        self.assertTrue(st_4k.center_on)
+        self.assertEqual(st_4k.center_rgb, (255, 213, 161))
+
+        # 2. Scene Christmas (19093 = 0x4A95) @ 95%
+        frames_christmas = [
+            bytes.fromhex(h)
+            for h in (
+                "ac000a000b030001010104015f050304954a072f",
+                "ac010706b5e77e6813d4071110b4e77e6813d4ab",
+                "ac02ea3b0100310104030000070d11d413687e83",
+                "ac03e7b40100310104031104001e0f0f120700d4",
+                "ac04640000800f00231000000080000000800070",
+                "ac05000080000000804102020130020101a5116f",
+                "ac060164ff653b64ff653b64ff653b28ff653be7",
+                "ac07a5110228ff653b28ff653b28ff653b28ff43",
+                "ac08653ba5110364ff653b28ff653b28ff653b88",
+                "acff28ff653ba5050401ff653b000000000000de",
+            )
+        ]
+        st_xmas = protocol.parse_ble_status_frames(frames_christmas)
+        assert st_xmas is not None
+        self.assertTrue(st_xmas.is_on)
+        self.assertEqual(st_xmas.brightness, 95)
+        self.assertEqual(st_xmas.color_temp_kelvin, 0)
+        self.assertEqual(st_xmas.scene_code, 19093)
+
+        # 3. RGB mode @ 60%
+        frames_rgb = [
+            bytes.fromhex(h)
+            for h in (
+                "ac000a000c030001010104013c05041501000084",
+                "ac01070706b5e77e6813d4071110b4e77e681378",
+                "ac02d4ea3b0100310104030000070d11d4136829",
+                "ac037ee7b40100310104031104001e0f0f1207aa",
+                "ac0400640000800f002310000000800000008070",
+                "ac0500000080000000804102020130020101a57e",
+                "ac06110164ff594464ff594464ff594428ff59b2",
+                "ac0744a5110228ff594428ff594428ff594428bb",
+                "ac08ff5944a5110364ff594428ff594428ff5933",
+                "acff4428ff5944a5050401ff594400000000009a",
+            )
+        ]
+        st_rgb = protocol.parse_ble_status_frames(frames_rgb)
+        assert st_rgb is not None
+        self.assertTrue(st_rgb.is_on)
+        self.assertEqual(st_rgb.brightness, 60)
+        self.assertEqual(st_rgb.color_temp_kelvin, 0)
+        self.assertEqual(st_rgb.rgb, (255, 89, 68))
 
     def test_parse_govee_library_and_load_scenes(self) -> None:
         import tempfile

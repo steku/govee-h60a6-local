@@ -39,6 +39,7 @@ from .const import (
 )
 from .protocol import (
     DiscoveredDevice,
+    GoveeBleStatus,
     GoveeDeviceStatus,
     build_ble_brightness_packet,
     build_ble_color_temp_packet,
@@ -52,6 +53,7 @@ from .protocol import (
     build_ble_segment_brightness_packet,
     build_ble_segment_color_packet,
     build_ble_segment_color_temp_packet,
+    build_ble_status_query_packet,
     build_brightness_payload,
     build_color_payload,
     build_color_temp_payload,
@@ -64,6 +66,7 @@ from .protocol import (
     build_turn_payload,
     govee_ble_decrypt,
     govee_ble_encrypt,
+    parse_ble_status_frames,
     parse_lan_response,
     parse_scan_response,
     parse_status_response,
@@ -336,6 +339,8 @@ class GoveeBleTransport:
         self._session_key: bytes | None = None
         self._handshake_future: asyncio.Future[bytes] | None = None
         self._handshake_expected_step: int | None = None
+        self._ac_frames: list[bytes] = []
+        self._ac_done: asyncio.Future[list[bytes]] | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -349,6 +354,11 @@ class GoveeBleTransport:
             client = self._client_factory()
             if hasattr(client, "connect"):
                 await client.connect()
+            if hasattr(client, "start_notify"):
+                try:
+                    await client.start_notify(BLE_NOTIFY_CHAR_UUID, self._on_notify)
+                except Exception as err:
+                    _LOGGER.debug("Mock BLE start_notify skipped for %s: %s", self.address, err)
             self._client = client
             return client
 
@@ -399,6 +409,10 @@ class GoveeBleTransport:
             self._handshake_future.cancel()
         self._handshake_future = None
         self._handshake_expected_step = None
+        if self._ac_done is not None and not self._ac_done.done():
+            self._ac_done.cancel()
+        self._ac_done = None
+        self._ac_frames = []
 
     def _on_notify(self, _sender: Any, data: bytearray) -> None:
         raw = bytes(data)
@@ -415,14 +429,26 @@ class GoveeBleTransport:
                 self._handshake_future.set_result(dec)
                 return
 
-        if self._session_key is not None and len(raw) >= 16:
+        dec: bytes | None = None
+        if self._session_key is not None and raw:
             try:
                 dec = govee_ble_decrypt(raw, self._session_key)
                 _LOGGER.debug("Govee BLE notify (%s): %s", self.address, dec.hex())
-                return
             except Exception:
-                pass
-        _LOGGER.debug("Govee BLE notify (%s): %s", self.address, raw.hex())
+                dec = None
+        if dec is None:
+            dec = raw
+            _LOGGER.debug("Govee BLE notify (%s): %s", self.address, raw.hex())
+
+        if (
+            self._ac_done is not None
+            and not self._ac_done.done()
+            and len(dec) >= 2
+            and dec[0] == 0xAC
+        ):
+            self._ac_frames.append(dec)
+            if dec[1] == 0xFF:
+                self._ac_done.set_result(list(self._ac_frames))
 
     async def _async_handshake(self, client: Any) -> None:
         """Perform the MakingLifeSmarte E701/E702 session key handshake if supported."""
@@ -505,6 +531,36 @@ class GoveeBleTransport:
         """Send BLE keepalive heartbeat packet."""
         await self.async_send_packets([build_ble_keepalive_packet()])
 
+    async def async_query_status(self, timeout: float = 3.0) -> list[bytes]:
+        """Query full live H60A6 status over BLE (`ac 03 03 41 30 a5`)."""
+        async with self._lock:
+            try:
+                client = await self._ensure_connected()
+                loop = asyncio.get_running_loop()
+                self._ac_frames = []
+                fut: asyncio.Future[list[bytes]] = loop.create_future()
+                self._ac_done = fut
+                pkt = build_ble_status_query_packet()
+                wire_packet = (
+                    govee_ble_encrypt(pkt, self._session_key)
+                    if self._session_key is not None
+                    else pkt
+                )
+                await client.write_gatt_char(
+                    BLE_WRITE_CHAR_UUID, wire_packet, response=False
+                )
+                frames = await asyncio.wait_for(fut, timeout=timeout)
+                self._schedule_idle_disconnect()
+                return frames
+            except Exception as err:
+                await self._disconnect_unlocked()
+                raise GoveeTransportError(
+                    f"BLE status query to {self.address} failed: {err}"
+                ) from err
+            finally:
+                self._ac_done = None
+                self._ac_frames = []
+
     async def async_disconnect(self) -> None:
         """Disconnect cleanly from the BLE peripheral."""
         async with self._lock:
@@ -521,6 +577,10 @@ class GoveeBleTransport:
             self._handshake_future.cancel()
         self._handshake_future = None
         self._handshake_expected_step = None
+        if self._ac_done is not None and not self._ac_done.done():
+            self._ac_done.cancel()
+        self._ac_done = None
+        self._ac_frames = []
         if client is not None and getattr(client, "is_connected", False):
             try:
                 await client.disconnect()
@@ -693,6 +753,13 @@ class GoveeH60A6Client:
             raise GoveeTransportError(
                 f"Failed to query devStatus from {self.host}: {err}"
             ) from err
+
+    async def async_get_ble_status(self, timeout: float = 3.0) -> GoveeBleStatus | None:
+        """Query full H60A6 status (power, brightness, Kelvin, scene, segments) over BLE."""
+        if not self.ble_enabled or self.ble is None:
+            return None
+        frames = await self.ble.async_query_status(timeout=timeout)
+        return parse_ble_status_frames(frames)
 
     async def async_turn(self, is_on: bool) -> str:
         """Turn the H60A6 on or off."""

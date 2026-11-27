@@ -48,7 +48,7 @@ class GoveeH60A6RefreshButton(
         self._attr_device_info = build_device_info(coordinator)
 
     async def async_press(self) -> None:
-        await self.coordinator.async_request_refresh()
+        await self.coordinator.async_refresh_status()
 
 
 class GoveeH60A6StopEffectButton(

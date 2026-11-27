@@ -20,6 +20,7 @@ from .const import (
     ALL_RING_SEGMENTS_MASK,
     MAX_KELVIN,
     MIN_KELVIN,
+    RING_SEGMENT_COUNT,
     TOTAL_SEGMENT_COUNT,
 )
 
@@ -45,6 +46,20 @@ class GoveeDeviceStatus:
     brightness: int  # 1..100
     rgb: tuple[int, int, int]
     color_temp_kelvin: int  # 0 when in RGB mode, otherwise 2200..6500
+
+
+@dataclass
+class GoveeBleStatus:
+    """Full state snapshot parsed from a BLE `ac 03 03 41 30 a5` status query."""
+
+    is_on: bool
+    brightness: int  # 1..100
+    color_temp_kelvin: int  # 0 when in RGB/scene mode, otherwise 2200..6500
+    rgb: tuple[int, int, int]
+    scene_code: int | None = None
+    ring_segments: list[tuple[int, tuple[int, int, int]]] = field(default_factory=list)
+    center_on: bool | None = None
+    center_rgb: tuple[int, int, int] | None = None
 
 
 @dataclass
@@ -279,9 +294,9 @@ def build_ble_segment_color_temp_packet(
 ) -> bytes:
     """Build 20-byte dedicated WW/CW Kelvin segment packet (`33 05 15 01`).
 
-    Layout:
+    Layout (verified against Govee app H60A6 BLE captures at 3000K/4000K/6500K):
       [0..3]   33 05 15 01
-      [4..6]   00 00 00 (disable RGB mixing, engage dedicated WW/CW LEDs)
+      [4..6]   FF FF FF (white-mode RGB sentinel so full WW/CW output stays bright)
       [7..8]   Kelvin big-endian (k_hi, k_lo)
       [9..11]  Warm/cool white RGB approximation (wr, wg, wb)
       [12..13] 16-bit little-endian segment bitmask (mask_lo, mask_hi)
@@ -301,9 +316,9 @@ def build_ble_segment_color_temp_packet(
             0x05,
             0x15,
             0x01,
-            0x00,
-            0x00,
-            0x00,
+            0xFF,
+            0xFF,
+            0xFF,
             k_hi,
             k_lo,
             wr,
@@ -810,4 +825,110 @@ def parse_status_response(data: dict[str, Any]) -> GoveeDeviceStatus | None:
         brightness=brightness if brightness > 0 else 1,
         rgb=(r, g, b),
         color_temp_kelvin=kelvin,
+    )
+
+
+def build_ble_status_query_packet() -> bytes:
+    """Build 20-byte BLE full-state query packet (`ac 03 03 41 30 a5`)."""
+    return build_ble_packet([0xAC, 0x03, 0x03, 0x41, 0x30, 0xA5])
+
+
+def parse_ble_status_frames(frames: list[bytes]) -> GoveeBleStatus | None:
+    """Reassemble and decode multi-packet `0xAC` status notifications from the H60A6."""
+    ac_frames = [f for f in frames if len(f) >= 19 and f[0] == 0xAC]
+    if not ac_frames:
+        return None
+
+    head = next((f for f in ac_frames if f[1] == 0x00), None)
+    if head is None:
+        return None
+
+    tail = [f for f in ac_frames if f is not head]
+    tail.sort(key=lambda f: (1, 0) if f[1] == 0xFF else (0, f[1]))
+
+    raw = bytearray(head[4:19])
+    for frame in tail:
+        raw.extend(frame[2:19])
+
+    if len(raw) < 4:
+        return None
+
+    is_on = True
+    brightness = 100
+    color_temp_kelvin = 0
+    scene_code: int | None = None
+
+    # raw[0] = byte length of sub-TLV body following `raw[1:3]` (`03 00`)
+    hdr_body_len = raw[0]
+    hdr_end = min(len(raw), 3 + hdr_body_len)
+    pos = 3
+    while pos + 2 <= hdr_end:
+        tag = raw[pos]
+        length = raw[pos + 1]
+        val = raw[pos + 2 : min(hdr_end, pos + 2 + length)]
+        pos += 2 + length
+        if tag == 0x01 and len(val) >= 1:
+            is_on = bool(val[0])
+        elif tag == 0x04 and len(val) >= 1:
+            brightness = clamp(val[0], 1, 100) if val[0] > 0 else 1
+        elif tag == 0x05 and val:
+            if len(val) >= 4 and val[0] == 0x15 and val[1] == 0x01:
+                k_raw = (val[2] << 8) | val[3]
+                color_temp_kelvin = (
+                    clamp(k_raw, MIN_KELVIN, MAX_KELVIN) if k_raw > 0 else 0
+                )
+                scene_code = None
+            elif len(val) >= 3 and val[0] == 0x04:
+                scene_code = val[1] | (val[2] << 8)
+                color_temp_kelvin = 0
+
+    ring_segments: list[tuple[int, tuple[int, int, int]]] = []
+    center_on: bool | None = None
+    center_rgb: tuple[int, int, int] | None = None
+
+    a5_pos = raw.find(b"\xa5\x11\x01")
+    if a5_pos != -1:
+        # Three 19-byte blocks (`a5 11 01..03` + 4 segments * 4 bytes [br, r, g, b])
+        for grp in range(3):
+            grp_off = a5_pos + grp * 19
+            if grp_off + 19 > len(raw):
+                break
+            if raw[grp_off : grp_off + 3] != bytes([0xA5, 0x11, grp + 1]):
+                break
+            for seg_i in range(4):
+                off = grp_off + 3 + seg_i * 4
+                ring_segments.append(
+                    (
+                        clamp(raw[off], 0, 100),
+                        (raw[off + 1], raw[off + 2], raw[off + 3]),
+                    )
+                )
+        ring_segments = ring_segments[:RING_SEGMENT_COUNT]
+
+        center_off = a5_pos + 3 * 19
+        if center_off + 7 <= len(raw) and raw[center_off : center_off + 3] == b"\xa5\x05\x04":
+            center_on = bool(raw[center_off + 3])
+            center_rgb = (
+                raw[center_off + 4],
+                raw[center_off + 5],
+                raw[center_off + 6],
+            )
+
+    if color_temp_kelvin > 0:
+        rgb = kelvin_to_rgb(color_temp_kelvin)
+    elif center_rgb is not None and any(center_rgb):
+        rgb = center_rgb
+    else:
+        first_ring_rgb = next((c for _, c in ring_segments if any(c)), None)
+        rgb = first_ring_rgb if first_ring_rgb is not None else (255, 255, 255)
+
+    return GoveeBleStatus(
+        is_on=is_on,
+        brightness=brightness,
+        color_temp_kelvin=color_temp_kelvin,
+        rgb=rgb,
+        scene_code=scene_code,
+        ring_segments=ring_segments,
+        center_on=center_on,
+        center_rgb=center_rgb,
     )

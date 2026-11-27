@@ -147,6 +147,7 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
 
         if status is not None:
             prev_is_on = self.state.is_on
+            prev_brightness = self.state.brightness
             prev_rgb = self.state.rgb
             prev_kelvin = self.state.color_temp_kelvin
             self.state.is_on = status.is_on
@@ -165,6 +166,7 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
                     color_temp_kelvin=status.color_temp_kelvin,
                     mark_on=status.is_on,
                 )
+                self._sync_segments_brightness(status.brightness)
                 self._segments_initialized = True
             else:
                 color_changed = (
@@ -186,6 +188,8 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
                     self.state.ring.is_on = True
                     for seg in self.state.segments:
                         seg.is_on = True
+                if status.brightness != prev_brightness:
+                    self._sync_segments_brightness(status.brightness)
             if not status.is_on:
                 await self._cancel_effect_task()
                 self.state.effect = None
@@ -260,11 +264,86 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
             if reset_brightness:
                 seg.brightness = 100
 
+    def _sync_segments_brightness(self, brightness_pct: int) -> None:
+        """Keep tracked ring and per-segment brightness aligned with main-light dimming."""
+        pct = clamp(brightness_pct, 1, 100)
+        self.state.ring.brightness = pct
+        for seg in self.state.segments:
+            seg.brightness = pct
+
     def _notify_state(self) -> None:
         self.state.active_transport = self.client.active_transport
         self.state.available = self.client.active_transport != "offline"
         self.state.last_error = None
         self.async_set_updated_data(self.state)
+
+    async def async_refresh_status(self) -> None:
+        """Force an immediate full status refresh (preferring BLE 0xAC query when available)."""
+        if self.client.ble_enabled:
+            try:
+                ble_status = await self.client.async_get_ble_status()
+            except Exception as err:
+                _LOGGER.debug(
+                    "BLE full status query failed (%s); falling back to coordinator refresh",
+                    err,
+                )
+                ble_status = None
+
+            if ble_status is not None:
+                self.state.is_on = ble_status.is_on
+                self.state.brightness = ble_status.brightness
+                self.state.color_temp_kelvin = ble_status.color_temp_kelvin
+                if ble_status.color_temp_kelvin == 0:
+                    self.state.rgb = ble_status.rgb
+
+                if not ble_status.is_on:
+                    await self._cancel_effect_task()
+                    self.state.effect = None
+                elif ble_status.scene_code is not None:
+                    await self._cancel_effect_task()
+                    matched_name = next(
+                        (
+                            name
+                            for name, scene in self.scenes.items()
+                            if scene.scene_code == ble_status.scene_code
+                        ),
+                        None,
+                    )
+                    self.state.effect = matched_name or f"Scene #{ble_status.scene_code}"
+                elif self._effect_task is None:
+                    self.state.effect = None
+
+                ring_segments = self.state.segments[:RING_SEGMENT_COUNT]
+                for seg, (seg_b, seg_rgb) in zip(ring_segments, ble_status.ring_segments):
+                    has_color = any(seg_rgb)
+                    seg.is_on = seg_b > 0 and has_color
+                    if seg_b > 0:
+                        seg.brightness = clamp(seg_b, 1, 100)
+                    if has_color:
+                        seg.rgb = seg_rgb
+                    seg.color_temp_kelvin = 0
+
+                if ble_status.ring_segments:
+                    self.state.ring.is_on = any(s.is_on for s in ring_segments)
+                else:
+                    self.state.ring.is_on = ble_status.is_on
+                self.state.ring.color_temp_kelvin = ble_status.color_temp_kelvin
+                self.state.ring.rgb = ble_status.rgb
+                self.state.ring.brightness = ble_status.brightness
+
+                center_seg = self.state.segments[MAIN_CENTER_SEGMENT - 1]
+                if ble_status.center_on is not None:
+                    center_seg.is_on = ble_status.center_on
+                    center_seg.color_temp_kelvin = ble_status.color_temp_kelvin
+                    center_seg.brightness = ble_status.brightness
+                    if ble_status.center_rgb is not None and any(ble_status.center_rgb):
+                        center_seg.rgb = ble_status.center_rgb
+
+                self._segments_initialized = True
+                self._notify_state()
+                return
+
+        await self.async_request_refresh()
 
     # -----------------------------------------------------------------------
     # Primary Light Controls
@@ -290,7 +369,9 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
                 await self.async_start_effect(effect)
                 if brightness_pct is not None:
                     await self.client.async_set_brightness(brightness_pct)
-                    self.state.brightness = clamp(brightness_pct, 1, 100)
+                    pct = clamp(brightness_pct, 1, 100)
+                    self.state.brightness = pct
+                    self._sync_segments_brightness(pct)
                 self._notify_state()
                 return
 
@@ -351,6 +432,7 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
             pct = clamp(brightness_pct, 1, 100)
             await self.client.async_set_brightness(pct)
             self.state.brightness = pct
+            self._sync_segments_brightness(pct)
 
         self._notify_state()
 
@@ -420,6 +502,7 @@ class GoveeH60A6Coordinator(DataUpdateCoordinator[GoveeState]):
                     )
                     await self.client.async_set_brightness(pct)
                     self.state.brightness = pct
+                    self._sync_segments_brightness(pct)
 
                 self._notify_state()
                 if idx < steps:

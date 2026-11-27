@@ -650,7 +650,7 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
         # 4000 == 0x0FA0 on segment 13 (0x1000 -> LE 00 10)
         self.assertTrue(
             any(
-                pkt[0:9] == bytes([0x33, 0x05, 0x15, 0x01, 0, 0, 0, 0x0F, 0xA0])
+                pkt[0:9] == bytes([0x33, 0x05, 0x15, 0x01, 0xFF, 0xFF, 0xFF, 0x0F, 0xA0])
                 and pkt[12:14] == bytes([0x00, 0x10])
                 for pkt in ptreal_pkts
             )
@@ -822,6 +822,13 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seg3_light.rgb_color, (0, 200, 255))
         self.assertEqual(coord.state.segments[2].brightness, 100)
 
+        # Whole-light dimmer updates ring, ring segments, and center brightness in HA state
+        await main_light.async_turn_on(**{ATTR_BRIGHTNESS: 102})
+        await asyncio.sleep(0.05)
+        self.assertEqual(coord.state.ring.brightness, 40)
+        self.assertEqual(coord.state.segments[2].brightness, 40)
+        self.assertEqual(coord.state.segments[12].brightness, 40)
+
         # 3. External devStatus color change re-syncs ring and segments
         await seg3_light.async_turn_off()
         self.assertFalse(seg3_light.is_on)
@@ -866,6 +873,110 @@ class TestTransportAndEntities(unittest.IsolatedAsyncioTestCase):
         await seg3_light.async_added_to_hass()
         self.assertFalse(coord.state.segments[2].is_on)
         self.assertEqual(seg3_light.extra_state_attributes, {"segment_enabled": False})
+
+        await coord.async_shutdown_tasks()
+
+    async def test_refresh_status_button_queries_ble_state(self) -> None:
+        """Refresh Status pulls power, brightness, scene, center & ring segments via BLE 0xAC."""
+        from homeassistant.config_entries import ConfigEntry
+        from homeassistant.core import HomeAssistant
+
+        from custom_components.govee_h60a6_local.button import GoveeH60A6RefreshButton
+        from custom_components.govee_h60a6_local.const import (
+            BLE_WRITE_CHAR_UUID,
+            CONF_BLE_ADDRESS,
+            CONF_TRANSPORT_MODE,
+            TRANSPORT_BLE_ONLY,
+        )
+        from custom_components.govee_h60a6_local.coordinator import GoveeH60A6Coordinator
+        from custom_components.govee_h60a6_local.light import (
+            GoveeH60A6CenterLight,
+            GoveeH60A6MainLight,
+            GoveeH60A6RingLight,
+            GoveeH60A6SegmentLight,
+        )
+        from custom_components.govee_h60a6_local.protocol import (
+            build_ble_status_query_packet,
+        )
+        from custom_components.govee_h60a6_local.transport import (
+            GoveeBleTransport,
+            GoveeH60A6Client,
+        )
+
+        # Real H60A6 BLE 0xAC status notification frames captured from Govee app (Scene: Christmas 19093 @ 95%)
+        christmas_ac_frames = [
+            bytes.fromhex("ac000a000b030001010104015f050304954a072f"),
+            bytes.fromhex("ac010706b5e77e6813d4071110b4e77e6813d4ab"),
+            bytes.fromhex("ac02ea3b0100310104030000070d11d413687e83"),
+            bytes.fromhex("ac03e7b40100310104031104001e0f0f120700d4"),
+            bytes.fromhex("ac04640000800f00231000000080000000800070"),
+            bytes.fromhex("ac05000080000000804102020130020101a5116f"),
+            bytes.fromhex("ac060164ff653b64ff653b64ff653b28ff653be7"),
+            bytes.fromhex("ac07a5110228ff653b28ff653b28ff653b28ff43"),
+            bytes.fromhex("ac08653ba5110364ff653b28ff653b28ff653b88"),
+            bytes.fromhex("acff28ff653ba5050401ff653b000000000000de"),
+        ]
+
+        class StatusBleClient(FakeBleClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.notify_cb: Any = None
+
+            async def start_notify(self, _uuid: str, cb: Any) -> None:
+                self.notify_cb = cb
+
+            async def write_gatt_char(
+                self, uuid: str, data: bytes, response: bool = False
+            ) -> None:
+                await super().write_gatt_char(uuid, data, response=response)
+                if uuid == BLE_WRITE_CHAR_UUID and data == build_ble_status_query_packet():
+                    assert self.notify_cb is not None
+                    for frame in christmas_ac_frames:
+                        self.notify_cb(None, bytearray(frame))
+
+        fake_ble = StatusBleClient()
+        ble_transport = GoveeBleTransport(
+            "AA:BB:CC:DD:EE:FF",
+            idle_timeout=0,
+            client_factory=lambda: fake_ble,
+        )
+        hass = HomeAssistant()
+        entry = ConfigEntry(
+            entry_id="test_ble_refresh",
+            data={
+                CONF_BLE_ADDRESS: "AA:BB:CC:DD:EE:FF",
+                CONF_TRANSPORT_MODE: TRANSPORT_BLE_ONLY,
+            },
+            unique_id="h60a6_ble_refresh",
+        )
+        client = GoveeH60A6Client(
+            host=None,
+            ble_transport=ble_transport,
+            transport_mode=TRANSPORT_BLE_ONLY,
+            command_delay_ms=0,
+        )
+        coord = GoveeH60A6Coordinator(hass, entry, client, poll_interval=60)
+        main_light = GoveeH60A6MainLight(coord)
+        center_light = GoveeH60A6CenterLight(coord)
+        ring_light = GoveeH60A6RingLight(coord)
+        seg3_light = GoveeH60A6SegmentLight(coord, 3)
+        seg4_light = GoveeH60A6SegmentLight(coord, 4)
+        refresh_btn = GoveeH60A6RefreshButton(coord)
+
+        self.assertFalse(main_light.is_on)
+        await refresh_btn.async_press()
+
+        self.assertTrue(main_light.is_on)
+        self.assertEqual(coord.state.brightness, 95)
+        self.assertEqual(main_light.effect, "Scene: Christmas")
+        self.assertTrue(center_light.is_on)
+        self.assertEqual(center_light.rgb_color, (255, 101, 59))
+        self.assertTrue(ring_light.is_on)
+        self.assertTrue(seg3_light.is_on)
+        self.assertEqual(seg3_light.rgb_color, (255, 101, 59))
+        self.assertEqual(coord.state.segments[2].brightness, 100)
+        self.assertEqual(coord.state.segments[3].brightness, 40)
+        self.assertTrue(seg4_light.is_on)
 
         await coord.async_shutdown_tasks()
 
